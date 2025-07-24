@@ -1,130 +1,172 @@
-import os
-import torch
-from torch.utils.data import Dataset, Subset
-import numpy as np
-import logging
-from types import SimpleNamespace
 import matplotlib.pyplot as plt
-from matplotlib.axes import Axes
+import torch
+import numpy as np
 
-# --- Configuration ---
-def get_config():
-    """Returns a SimpleNamespace containing the base configuration."""
-    return SimpleNamespace(
-        run_name="EDA_Diffusion_Training",
-        epochs=100,
-        batch_size=16,
-        seed=42,
-        device="cuda:1" if torch.cuda.is_available() else "cpu", # Default to GPU 1
-        lr=1e-4,
-        noise_steps=1000,
-        sequence_length=3840, # 60s * 64Hz
-        num_channels=1, # EDA only
-        dataset_path="/fd24T/zzhao3/EDA/preprocessed_data/60s_0.25s",
-        output_path="/fd24T/zzhao3/EDA/results/eda_diffusion",
-        fold_for_training=17,
-        spec_loss_weight=0.5,
-        dataset_percentage=1.0,
-        resume_from=None
-    )
+def visualize_reconstruction(model, signal, title="MAE Reconstruction"):
+    """
+    Visualizes the original time series and the MAE's reconstruction.
 
-# --- Data Loading ---
-class WESADDataset(Dataset):
-    """Loads the 'Y_train' EDA signals from a single preprocessed WESAD .npz fold."""
-    def __init__(self, data_path, fold_number):
-        super().__init__()
-        file_path = os.path.join(data_path, f"fold_{fold_number}.npz")
-        logging.info(f"Loading training data from: {file_path}")
-        if not os.path.exists(file_path):
-            raise FileNotFoundError(f"Data file not found: {file_path}")
-        with np.load(file_path) as data:
-            self.signals = data['Y_train'][:, np.newaxis, :]
-        logging.info(f"Loaded {self.signals.shape[0]} windows from fold {fold_number}.")
+    Args:
+        model (CheapSensorMAE): The trained MAE model.
+        signal (torch.Tensor): A single time series signal tensor (1, 1, L).
+        title (str): The title for the plot.
+    """
+    model.eval()
+    with torch.no_grad():
+        original_patched, pred_patched, mask = model.forward_with_visualization(signal)
 
-    def __len__(self):
-        return len(self.signals)
+    # Unpatchify to get the full time series
+    original_signal = model.unpatchify(original_patched).squeeze().cpu().numpy()
+    pred_signal = model.unpatchify(pred_patched).squeeze().cpu().numpy()
+    
+    # The mask is on patches, so we need to repeat it for each value in the patch
+    mask = mask.repeat_interleave(model.window_len).cpu().numpy()
 
-    def __getitem__(self, idx) -> torch.Tensor:
-        return torch.from_numpy(self.signals[idx]).float()
+    plt.figure(figsize=(20, 5))
+    plt.title(title)
+    plt.plot(original_signal, label="Original Signal")
+    plt.plot(pred_signal, label="Reconstructed Signal", linestyle='--')
+    
+    # Create a shaded region for the masked parts
+    plt.fill_between(np.arange(len(mask)), 
+                     plt.ylim()[0], 
+                     plt.ylim()[1], 
+                     where=mask==1, 
+                     color='red', 
+                     alpha=0.2, 
+                     label='Masked Area')
 
-# --- Plotting Functions ---
-def plot_reconstructions(ground_truth: torch.Tensor, reconstructions: torch.Tensor, path: str, num_samples: int = 3):
-    """Saves a plot comparing ground truth signals and their reconstructions by overlaying them."""
-    fig, axes = plt.subplots(num_samples, 1, figsize=(15, 4 * num_samples), sharex=True, sharey=True)
-    if num_samples == 1:
-        axes = [axes]
-    
-    gt_to_plot = ground_truth.cpu().numpy()
-    recon_to_plot = reconstructions.cpu().numpy()
-
-    ax_list = axes if isinstance(axes, list) else axes.flatten()
-    for i in range(num_samples):
-        ax: Axes = ax_list[i]
-        ax.plot(gt_to_plot[i, 0, :], 'g', label='Ground Truth')
-        ax.plot(recon_to_plot[i, 0, :], 'b', label='Reconstruction', alpha=0.7)
-        ax.set_title(f"Reconstruction vs. Ground Truth (Sample {i+1})")
-        ax.set_ylabel("Signal Value")
-        ax.legend()
-        ax.grid(True)
-    
-    ax_list[-1].set_xlabel("Time Step")
-    fig.suptitle("One-to-One Signal Reconstruction", fontsize=16)
-    fig.tight_layout(rect=(0, 0.03, 1, 0.96))
-    plt.savefig(path)
-    plt.close()
-
-def plot_loss_subplots(path: str, total_train, total_val, mse_train, mse_val, spec_train, spec_val):
-    """Saves a plot of loss curves for all components in separate subplots."""
-    fig, axes = plt.subplots(3, 1, figsize=(10, 15), sharex=True)
-    ax_list = axes.flatten()
-
-    # Total Loss
-    ax_list[0].plot(total_train, label="Training Loss")
-    ax_list[0].plot(total_val, label="Validation Loss")
-    ax_list[0].set_title("Total Combined Loss")
-    ax_list[0].set_ylabel("Loss")
-    ax_list[0].legend()
-    ax_list[0].grid(True)
-    
-    # MSE Loss
-    ax_list[1].plot(mse_train, label="Training MSE Loss")
-    ax_list[1].plot(mse_val, label="Validation MSE Loss")
-    ax_list[1].set_title("MSE Loss Component")
-    ax_list[1].set_ylabel("Loss")
-    ax_list[1].legend()
-    ax_list[1].grid(True)
-    
-    # Spectral Loss
-    ax_list[2].plot(spec_train, label="Training Spectral Loss")
-    ax_list[2].plot(spec_val, label="Validation Spectral Loss")
-    ax_list[2].set_title("Spectral Loss Component")
-    ax_list[2].set_ylabel("Loss")
-    ax_list[2].legend()
-    ax_list[2].grid(True)
-    
-    plt.xlabel("Epoch")
-    fig.tight_layout()
-    plt.savefig(path)
-    plt.close()
-
-def plot_all_loss_curves(path: str, total_train, total_val, mse_train, mse_val, spec_train, spec_val):
-    """Saves a plot of all 6 loss curves on a single canvas."""
-    plt.figure(figsize=(12, 8))
-    
-    plt.plot(total_train, label='Train Total', color='blue', linestyle='-')
-    plt.plot(total_val, label='Val Total', color='blue', linestyle='--')
-    
-    plt.plot(mse_train, label='Train MSE', color='green', linestyle='-')
-    plt.plot(mse_val, label='Val MSE', color='green', linestyle='--')
-    
-    plt.plot(spec_train, label='Train Spectral', color='red', linestyle='-')
-    plt.plot(spec_val, label='Val Spectral', color='red', linestyle='--')
-    
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.title("All Loss Curves")
+    plt.xlabel("Time Steps")
+    plt.ylabel("Signal Value")
     plt.legend()
     plt.grid(True)
-    plt.tight_layout()
+    plt.show()
+
+def plot_mae_losses(losses_df, path):
+    """
+    Plots and saves the training and validation loss curves for the MAE model.
+    The plot will contain four subplots for total, reconstruction, and alignment losses, and learning rate.
+    """
+    fig, axes = plt.subplots(4, 1, figsize=(10, 20), sharex=True)
+    fig.suptitle('MAE Training Curves', fontsize=16)
+
+    # Plot Total Loss
+    axes[0].plot(losses_df['epoch'], losses_df['train_total_loss'], label='Train Total Loss')
+    axes[0].plot(losses_df['epoch'], losses_df['val_total_loss'], label='Validation Total Loss', linestyle='--')
+    axes[0].set_ylabel('Loss')
+    axes[0].set_title('Total Loss')
+    axes[0].legend()
+    axes[0].grid(True)
+
+    # Plot Reconstruction Loss
+    axes[1].plot(losses_df['epoch'], losses_df['train_recon_loss'], label='Train Reconstruction Loss')
+    axes[1].plot(losses_df['epoch'], losses_df['val_recon_loss'], label='Validation Reconstruction Loss', linestyle='--')
+    axes[1].set_ylabel('Loss')
+    axes[1].set_title('Reconstruction Loss')
+    axes[1].legend()
+    axes[1].grid(True)
+
+    # Plot Alignment Loss
+    axes[2].plot(losses_df['epoch'], losses_df['train_align_loss'], label='Train Alignment Loss')
+    axes[2].plot(losses_df['epoch'], losses_df['val_align_loss'], label='Validation Alignment Loss', linestyle='--')
+    axes[2].set_xlabel('Epoch')
+    axes[2].set_ylabel('Loss')
+    axes[2].set_title('Alignment Loss')
+    axes[2].legend()
+    axes[2].grid(True)
+
+    # Plot Learning Rate
+    axes[3].plot(losses_df['epoch'], losses_df['lr'], label='Learning Rate')
+    axes[3].set_xlabel('Epoch')
+    axes[3].set_ylabel('Learning Rate')
+    axes[3].set_title('Learning Rate Schedule')
+    axes[3].legend()
+    axes[3].grid(True)
+
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     plt.savefig(path)
-    plt.close() 
+    plt.close(fig)
+
+def plot_single_loss_curve(losses_df, path):
+    """
+    Plots and saves a single training and validation loss curve.
+    """
+    plt.figure(figsize=(10, 6))
+    plt.plot(losses_df['epoch'], losses_df['train_loss'], label='Train Loss')
+    plt.plot(losses_df['epoch'], losses_df['val_loss'], label='Validation Loss', linestyle='--')
+    plt.title('MAE Loss Curve')
+    plt.xlabel('Epoch')
+    plt.ylabel('Reconstruction Loss')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(path)
+    plt.close()
+
+def plot_single_reconstruction(model, signal, output_path, title="Signal Reconstruction"):
+    """
+    Plots and saves a single signal reconstruction.
+    
+    Args:
+        model (nn.Module): The trained model.
+        signal (torch.Tensor): A single time series signal tensor, e.g., (1, 1, L).
+        output_path (str): Path to save the plot image.
+        title (str): The title for the plot.
+    """
+    model.eval()
+    with torch.no_grad():
+        original_patched, pred_patched, mask = model.forward_with_visualization(signal)
+
+    original_signal = model.unpatchify(original_patched).squeeze().cpu().numpy()
+    pred_signal = model.unpatchify(pred_patched).squeeze().cpu().numpy()
+    mask = mask.repeat_interleave(model.window_len).cpu().numpy()
+
+    fig = plt.figure(figsize=(20, 5))
+    plt.title(title)
+    plt.plot(original_signal, label="Original Signal")
+    plt.plot(pred_signal, label="Reconstructed Signal", linestyle='--')
+    
+    bottom, top = plt.ylim()
+    plt.fill_between(np.arange(len(mask)), bottom, top, where=mask==1, color='red', alpha=0.2, label='Masked Area')
+
+    plt.xlabel("Time Steps")
+    plt.ylabel("Signal Value")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(output_path)
+    plt.close(fig)
+
+def plot_reconstructions(models, data_batch, device, output_path):
+    """
+    Plots and saves a comparison of original vs. reconstructed signals for each modality.
+    """
+    fig, axes = plt.subplots(len(models), 1, figsize=(15, 12))
+    fig.suptitle('Signal Reconstructions', fontsize=16)
+    
+    # Take the first sample from the batch for visualization
+    for i, (name, model) in enumerate(models.items()):
+        model.eval()
+        ax = axes[i]
+        signal = data_batch[name][0].unsqueeze(0).to(device) # Shape: (1, 1, L)
+        
+        with torch.no_grad():
+            original_patched, pred_patched, mask = model.forward_with_visualization(signal)
+            
+        original_signal = model.unpatchify(original_patched).squeeze().cpu().numpy()
+        pred_signal = model.unpatchify(pred_patched).squeeze().cpu().numpy()
+        mask = mask.repeat_interleave(model.window_len).cpu().numpy()
+        
+        ax.plot(original_signal, label="Original Signal")
+        ax.plot(pred_signal, label="Reconstructed Signal", linestyle='--')
+        
+        # Get current y-limits to draw the shaded region
+        bottom, top = ax.get_ylim()
+        ax.fill_between(np.arange(len(mask)), bottom, top, where=mask==1, color='red', alpha=0.2, label='Masked Area')
+        
+        ax.set_title(f"Modality: {name.upper()}")
+        ax.legend()
+        ax.grid(True)
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.savefig(output_path)
+    plt.close(fig) 
