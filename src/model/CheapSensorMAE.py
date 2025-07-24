@@ -69,6 +69,17 @@ class Encoder(nn.Module):
             for i in range(depth)])
         self.norm = norm_layer(embed_dim)
 
+        # --- Create fixed private mask ---
+        num_private = int(embed_dim * self.private_mask_ratio)
+        # Generate a random permutation of indices
+        noise = torch.rand(embed_dim)
+        ids_shuffle_private = torch.argsort(noise)
+        # Create the binary mask
+        private_mask = torch.zeros(embed_dim)
+        private_mask[ids_shuffle_private[:num_private]] = 1.0
+        # Register as a buffer so it's moved to the correct device with the model
+        self.register_buffer('private_mask', private_mask)
+
         self.initialize_weights()
 
 
@@ -120,18 +131,10 @@ class Encoder(nn.Module):
         for blk in self.blocks:
             x = blk(x)
         x = self.norm(x)
-        # expected shape (batch_size, num_visible_patches + 1, embed_dim)
-        D = x.shape[-1]
-        num_private = int(D * self.private_mask_ratio)
-
-        noise = torch.rand(D, device=x.device)
-        ids_shuffle_private = torch.argsort(noise)
-
-        private_mask = torch.zeros(D, device=x.device)
-        private_mask[ids_shuffle_private[:num_private]] = 1.0
-
-        private_embedding = x * private_mask
-        shared_embedding = x * (1 - private_mask)
+        
+        # Use the fixed private mask
+        private_embedding = x * self.private_mask
+        shared_embedding = x * (1 - self.private_mask)
         
         return private_embedding, shared_embedding, mask
 

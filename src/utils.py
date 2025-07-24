@@ -45,10 +45,10 @@ def visualize_reconstruction(model, signal, title="MAE Reconstruction"):
 def plot_mae_losses(losses_df, path):
     """
     Plots and saves the training and validation loss curves for the MAE model.
-    The plot will contain three subplots for total, reconstruction, and alignment losses.
+    The plot will contain four subplots for total, reconstruction, and alignment losses, and learning rate.
     """
-    fig, axes = plt.subplots(3, 1, figsize=(10, 15), sharex=True)
-    fig.suptitle('MAE Loss Curves', fontsize=16)
+    fig, axes = plt.subplots(4, 1, figsize=(10, 20), sharex=True)
+    fig.suptitle('MAE Training Curves', fontsize=16)
 
     # Plot Total Loss
     axes[0].plot(losses_df['epoch'], losses_df['train_total_loss'], label='Train Total Loss')
@@ -75,6 +75,15 @@ def plot_mae_losses(losses_df, path):
     axes[2].legend()
     axes[2].grid(True)
 
+    # Plot Learning Rate
+    axes[3].plot(losses_df['epoch'], losses_df['lr'], label='Learning Rate')
+    axes[3].set_xlabel('Epoch')
+    axes[3].set_ylabel('Learning Rate')
+    axes[3].set_title('Learning Rate Schedule')
+    axes[3].legend()
+    axes[3].grid(True)
+
+
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     plt.savefig(path)
     plt.close(fig)
@@ -93,6 +102,39 @@ def plot_single_loss_curve(losses_df, path):
     plt.grid(True)
     plt.savefig(path)
     plt.close()
+
+def plot_single_reconstruction(model, signal, output_path, title="Signal Reconstruction"):
+    """
+    Plots and saves a single signal reconstruction.
+    
+    Args:
+        model (nn.Module): The trained model.
+        signal (torch.Tensor): A single time series signal tensor, e.g., (1, 1, L).
+        output_path (str): Path to save the plot image.
+        title (str): The title for the plot.
+    """
+    model.eval()
+    with torch.no_grad():
+        original_patched, pred_patched, mask = model.forward_with_visualization(signal)
+
+    original_signal = model.unpatchify(original_patched).squeeze().cpu().numpy()
+    pred_signal = model.unpatchify(pred_patched).squeeze().cpu().numpy()
+    mask = mask.repeat_interleave(model.window_len).cpu().numpy()
+
+    fig = plt.figure(figsize=(20, 5))
+    plt.title(title)
+    plt.plot(original_signal, label="Original Signal")
+    plt.plot(pred_signal, label="Reconstructed Signal", linestyle='--')
+    
+    bottom, top = plt.ylim()
+    plt.fill_between(np.arange(len(mask)), bottom, top, where=mask==1, color='red', alpha=0.2, label='Masked Area')
+
+    plt.xlabel("Time Steps")
+    plt.ylabel("Signal Value")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(output_path)
+    plt.close(fig)
 
 def plot_reconstructions(models, data_batch, device, output_path):
     """

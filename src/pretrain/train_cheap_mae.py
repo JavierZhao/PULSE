@@ -135,7 +135,7 @@ def train(args):
         'temp': CheapSensorMAE(modality_name='temp', sig_len=args.signal_length, window_len=args.patch_window_len, private_mask_ratio=args.private_mask_ratio).to(device)
     }
     optimizers = {name: torch.optim.Adam(model.parameters(), lr=args.learning_rate) for name, model in models.items()}
-    schedulers = {name: torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.num_epochs) for name, opt in optimizers.items()}
+    schedulers = {name: torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(opt, T_0=args.lr_restart_epochs) for name, opt in optimizers.items()}
 
     # --- Load Checkpoint ---
     start_epoch, best_val_loss, losses = 0, float('inf'), []
@@ -250,10 +250,12 @@ def train(args):
             sch.step()
 
         # --- Save Losses and Checkpoints ---
+        current_lr = schedulers['ecg'].get_last_lr()[0] # Get LR from one of the schedulers
         losses.append({
             'epoch': epoch + 1,
             'train_total_loss': avg_train_total_loss, 'train_recon_loss': avg_train_recon_loss, 'train_align_loss': avg_train_align_loss,
-            'val_total_loss': val_losses['total'], 'val_recon_loss': val_losses['recon'], 'val_align_loss': val_losses['align']
+            'val_total_loss': val_losses['total'], 'val_recon_loss': val_losses['recon'], 'val_align_loss': val_losses['align'],
+            'lr': current_lr
         })
         losses_df = pd.DataFrame(losses)
         
@@ -266,7 +268,8 @@ def train(args):
                  train_align_loss=losses_df['train_align_loss'].values,
                  val_total_loss=losses_df['val_total_loss'].values,
                  val_recon_loss=losses_df['val_recon_loss'].values,
-                 val_align_loss=losses_df['val_align_loss'].values)
+                 val_align_loss=losses_df['val_align_loss'].values,
+                 lr=losses_df['lr'].values)
 
         if val_losses['total'] < best_val_loss:
             best_val_loss = val_losses['total']
@@ -310,6 +313,7 @@ def main():
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size for training')
     parser.add_argument('--learning_rate', type=float, default=1e-4, help='Learning rate for the optimizer')
     parser.add_argument('--num_epochs', type=int, default=100, help='Number of epochs to train for')
+    parser.add_argument('--lr_restart_epochs', type=int, default=20, help='Number of epochs for the first restart in CosineAnnealingWarmRestarts scheduler (T_0).')
     parser.add_argument('--private_mask_ratio', type=float, default=0.5, help='Ratio of private to shared embeddings')
     args = parser.parse_args()
 

@@ -14,7 +14,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '.
 
 from src.model.CheapSensorMAE import CheapSensorMAE
 from src.data.wesad_dataset import WESADDataset
-from src.utils import plot_single_loss_curve
+from src.utils import plot_single_loss_curve, plot_single_reconstruction
 
 def setup_logging(run_name, output_path):
     log_dir = os.path.join(output_path, run_name)
@@ -123,6 +123,10 @@ def train(args):
     train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
     val_dataloader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
     
+    # Get a fixed batch from the validation set for visualization
+    vis_batch = next(iter(val_dataloader))
+    vis_sig = vis_batch['eda'][0].unsqueeze(0).to(device) # Get the first sample and add batch dim
+
     for epoch in range(start_epoch, args.num_epochs):
         logging.info(f"--- Epoch {epoch+1}/{args.num_epochs} ---")
         
@@ -167,6 +171,11 @@ def train(args):
             plot_path = os.path.join(run_output_path, "loss_curves.png")
             plot_single_loss_curve(losses_df, plot_path)
             logging.info(f"Saved loss plot to {plot_path}")
+
+            # Plot reconstructions
+            recon_plot_path = os.path.join(run_output_path, f"reconstruction_epoch_{epoch+1}.png")
+            plot_single_reconstruction(model, vis_sig, recon_plot_path, title=f"EDA Reconstruction Epoch {epoch+1}")
+            logging.info(f"Saved reconstruction plot to {recon_plot_path}")
 
     logging.info("Training complete.")
     final_plot_path = os.path.join(run_output_path, "loss_curves.png")
