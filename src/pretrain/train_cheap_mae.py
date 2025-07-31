@@ -135,7 +135,7 @@ def train(args):
         'temp': CheapSensorMAE(modality_name='temp', sig_len=args.signal_length, window_len=args.patch_window_len, private_mask_ratio=args.private_mask_ratio).to(device)
     }
     optimizers = {name: torch.optim.Adam(model.parameters(), lr=args.learning_rate) for name, model in models.items()}
-    schedulers = {name: torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(opt, T_0=args.lr_restart_epochs) for name, opt in optimizers.items()}
+    schedulers = {name: torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(opt, T_0=args.lr_restart_epochs, T_mult=args.t_mult) for name, opt in optimizers.items()}
 
     # --- Load Checkpoint ---
     start_epoch, best_val_loss, losses = 0, float('inf'), []
@@ -314,6 +314,7 @@ def main():
     parser.add_argument('--learning_rate', type=float, default=1e-4, help='Learning rate for the optimizer')
     parser.add_argument('--num_epochs', type=int, default=100, help='Number of epochs to train for')
     parser.add_argument('--lr_restart_epochs', type=int, default=20, help='Number of epochs for the first restart in CosineAnnealingWarmRestarts scheduler (T_0).')
+    parser.add_argument('--t_mult', type=int, default=1, help='Factor by which to increase T_i after a restart. T_mult=1 is constant.')
     parser.add_argument('--private_mask_ratio', type=float, default=0.5, help='Ratio of private to shared embeddings')
     args = parser.parse_args()
 
