@@ -240,9 +240,9 @@ class CheapSensorMAE(nn.Module):
     """ Masked Autoencoder with VisionTransformer backbone
     """
     def __init__(self, modality_name, sig_len=2500, window_len=100, in_chans=1,
-                 embed_dim=1024, embed_squeeze=0.5, depth=8, num_heads=8,
+                 embed_dim=1024, depth=8, num_heads=8,
                  decoder_embed_dim=512, decoder_depth=4, decoder_num_heads=16,
-                 mlp_ratio=4., norm_layer=nn.LayerNorm, norm_pix_loss=True, private_mask_ratio=0.5):
+                 mlp_ratio=4., decoder_mlp_ratio=4.0, norm_layer=nn.LayerNorm, norm_pix_loss=True, private_mask_ratio=0.5):
         super().__init__()
 
         # --------------------------------------------------------------------------
@@ -264,7 +264,7 @@ class CheapSensorMAE(nn.Module):
 
         #self.correlator = Correlator(channel_id, embed_dim, embed_squeeze)
 
-        self.decoder = Decoder(in_chans, self.window_len, self.num_patches, embed_dim, decoder_embed_dim, decoder_depth, decoder_num_heads, mlp_ratio, norm_layer)
+        self.decoder = Decoder(in_chans, self.window_len, self.num_patches, embed_dim, decoder_embed_dim, decoder_depth, decoder_num_heads, decoder_mlp_ratio, norm_layer)
 
         
         # --------------------------------------------------------------------------

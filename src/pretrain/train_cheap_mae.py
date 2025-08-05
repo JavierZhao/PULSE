@@ -16,6 +16,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '.
 from src.model.CheapSensorMAE import CheapSensorMAE
 from src.data.wesad_dataset import WESADDataset
 from src.utils import plot_mae_losses, plot_reconstructions
+from src.modules.hinge_loss import AllPairsHingeLoss
 
 def setup_logging(run_name, output_path):
     """Configures logging to file and console."""
@@ -73,12 +74,19 @@ def load_checkpoint(path, models, optimizers, schedulers, device):
     logging.info(f"Resumed from epoch {epoch}. Best validation loss was {best_val_loss:.4f}.")
     return epoch, best_val_loss, losses
 
-def validate(models, dataloader, device, alignment_loss_weight):
+def validate(models, dataloader, device, alignment_loss_fn, alignment_loss_weight, use_curriculum=False, epoch=0, num_epochs=1):
     """Runs a validation loop and returns the average loss."""
     for model in models.values():
         model.eval()
     total_loss, total_recon_loss, total_align_loss = 0, 0, 0
-    alignment_loss_fn = nn.CosineSimilarity(dim=1)
+
+    if use_curriculum:
+        ratio = (epoch + 1) / num_epochs
+        align_weight = np.sin(ratio * np.pi / 2)
+        recon_weight = np.cos(ratio * np.pi / 2)
+    else:
+        align_weight = alignment_loss_weight
+        recon_weight = 1.0
 
     with torch.no_grad():
         pbar_val = tqdm(dataloader, desc="Validating")
@@ -86,18 +94,18 @@ def validate(models, dataloader, device, alignment_loss_weight):
             ecg_sig, bvp_sig, acc_sig, temp_sig = [batch[k].to(device) for k in ('ecg', 'bvp', 'acc', 'temp')]
             
             # Step 1: Get all embeddings from the encoders
-            all_private_embs, all_shared_embs, all_masks, all_ids_restore = {}, [], {}, {}
+            all_private_embs, all_shared_embs, all_masks, all_ids_restore = {}, {}, {}, {}
             for name, sig in [('ecg', ecg_sig), ('bvp', bvp_sig), ('acc', acc_sig), ('temp', temp_sig)]:
                 model = models[name]
                 ids_shuffle, ids_restore, ids_keep = model.propose_masking(len(sig), model.num_patches, 0.75, device)
                 private, shared, mask = model.forward_encoder(sig, 0.75, ids_shuffle, ids_restore, ids_keep)
                 all_private_embs[name] = private
-                all_shared_embs.append(shared)
+                all_shared_embs[name] = shared # Use dict for shared embeddings
                 all_masks[name] = mask
                 all_ids_restore[name] = ids_restore
 
             # Step 2: Create the aligned shared embedding by averaging
-            aligned_shared_emb = torch.stack(all_shared_embs).mean(dim=0)
+            aligned_shared_emb = torch.stack(list(all_shared_embs.values())).mean(dim=0)
             
             # Step 3: Calculate reconstruction loss using the aligned shared embedding
             reconstruction_loss = 0
@@ -105,12 +113,15 @@ def validate(models, dataloader, device, alignment_loss_weight):
                 rec = models[name].forward_decoder(all_private_embs[name], aligned_shared_emb, all_ids_restore[name])
                 reconstruction_loss += models[name].reconstruction_loss(sig, rec, all_masks[name])
 
-            # Step 4: Calculate alignment loss on the original (pre-average) shared embeddings
-            loss_align = 1 - alignment_loss_fn(all_shared_embs[0].mean(dim=1), all_shared_embs[1].mean(dim=1)).mean() + \
-                         1 - alignment_loss_fn(all_shared_embs[0].mean(dim=1), all_shared_embs[2].mean(dim=1)).mean() + \
-                         1 - alignment_loss_fn(all_shared_embs[0].mean(dim=1), all_shared_embs[3].mean(dim=1)).mean()
+            # Step 4: Calculate alignment loss using Hinge Loss
+            # First, get a single vector representation for each signal by averaging patch embeddings
+            all_shared_embs_mean = {k: v.mean(dim=1) for k, v in all_shared_embs.items()}
+            # Then, normalize these summary vectors before passing to loss function
+            normalized_shared_embs = {k: nn.functional.normalize(v, p=2, dim=1) for k, v in all_shared_embs_mean.items()}
+            loss_align = alignment_loss_fn(normalized_shared_embs)
             
-            total_loss += (reconstruction_loss + alignment_loss_weight * loss_align).item()
+            loss = recon_weight * reconstruction_loss + align_weight * loss_align
+            total_loss += loss.item()
             total_recon_loss += reconstruction_loss.item()
             total_align_loss += loss_align.item()
 
@@ -128,11 +139,31 @@ def train(args):
     os.makedirs(models_path, exist_ok=True)
     
     # --- Models, Optimizers, Schedulers ---
+    if args.big_model:
+        args.decoder_depth += 2
+        args.decoder_mlp_ratio *= 2
+        args.embed_dim = 1024+256
+        args.decoder_embed_dim = 1024+256
+        args.num_heads = 8
+        args.decoder_num_heads = 8
+
     models = {
-        'ecg': CheapSensorMAE(modality_name='ecg', sig_len=args.signal_length, window_len=args.patch_window_len, private_mask_ratio=args.private_mask_ratio).to(device),
-        'bvp': CheapSensorMAE(modality_name='bvp', sig_len=args.signal_length, window_len=args.patch_window_len, private_mask_ratio=args.private_mask_ratio).to(device),
-        'acc': CheapSensorMAE(modality_name='acc', sig_len=args.signal_length, window_len=args.patch_window_len, private_mask_ratio=args.private_mask_ratio).to(device),
-        'temp': CheapSensorMAE(modality_name='temp', sig_len=args.signal_length, window_len=args.patch_window_len, private_mask_ratio=args.private_mask_ratio).to(device)
+        'ecg': CheapSensorMAE(modality_name='ecg', sig_len=args.signal_length, window_len=args.patch_window_len, private_mask_ratio=args.private_mask_ratio,
+                              embed_dim=args.embed_dim, depth=args.depth, num_heads=args.num_heads,
+                              decoder_embed_dim=args.decoder_embed_dim, decoder_depth=args.decoder_depth, decoder_num_heads=args.decoder_num_heads,
+                              mlp_ratio=args.mlp_ratio, decoder_mlp_ratio=args.decoder_mlp_ratio).to(device),
+        'bvp': CheapSensorMAE(modality_name='bvp', sig_len=args.signal_length, window_len=args.patch_window_len, private_mask_ratio=args.private_mask_ratio,
+                              embed_dim=args.embed_dim, depth=args.depth, num_heads=args.num_heads,
+                              decoder_embed_dim=args.decoder_embed_dim, decoder_depth=args.decoder_depth, decoder_num_heads=args.decoder_num_heads,
+                              mlp_ratio=args.mlp_ratio, decoder_mlp_ratio=args.decoder_mlp_ratio).to(device),
+        'acc': CheapSensorMAE(modality_name='acc', sig_len=args.signal_length, window_len=args.patch_window_len, private_mask_ratio=args.private_mask_ratio,
+                              embed_dim=args.embed_dim, depth=args.depth, num_heads=args.num_heads,
+                              decoder_embed_dim=args.decoder_embed_dim, decoder_depth=args.decoder_depth, decoder_num_heads=args.decoder_num_heads,
+                              mlp_ratio=args.mlp_ratio, decoder_mlp_ratio=args.decoder_mlp_ratio).to(device),
+        'temp': CheapSensorMAE(modality_name='temp', sig_len=args.signal_length, window_len=args.patch_window_len, private_mask_ratio=args.private_mask_ratio,
+                               embed_dim=args.embed_dim, depth=args.depth, num_heads=args.num_heads,
+                               decoder_embed_dim=args.decoder_embed_dim, decoder_depth=args.decoder_depth, decoder_num_heads=args.decoder_num_heads,
+                               mlp_ratio=args.mlp_ratio, decoder_mlp_ratio=args.decoder_mlp_ratio).to(device)
     }
     optimizers = {name: torch.optim.Adam(model.parameters(), lr=args.learning_rate) for name, model in models.items()}
     schedulers = {name: torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(opt, T_0=args.lr_restart_epochs, T_mult=args.t_mult) for name, opt in optimizers.items()}
@@ -182,7 +213,7 @@ def train(args):
     # Get a fixed batch from the validation set for visualization
     vis_batch = next(iter(val_dataloader))
     
-    alignment_loss_fn = nn.CosineSimilarity(dim=1)
+    alignment_loss_fn = AllPairsHingeLoss(alpha=args.hinge_alpha, neg_sample_percent=args.hinge_neg_sample_percent)
     
     for epoch in range(start_epoch, args.num_epochs):
         logging.info(f"--- Epoch {epoch+1}/{args.num_epochs} ---")
@@ -201,18 +232,18 @@ def train(args):
                 opt.zero_grad()
                 
             # Step 1: Get all embeddings from the encoders
-            all_private_embs, all_shared_embs, all_masks, all_ids_restore = {}, [], {}, {}
+            all_private_embs, all_shared_embs, all_masks, all_ids_restore = {}, {}, {}, {}
             for name, sig in [('ecg', ecg_sig), ('bvp', bvp_sig), ('acc', acc_sig), ('temp', temp_sig)]:
                 model = models[name]
                 ids_shuffle, ids_restore, ids_keep = model.propose_masking(len(sig), model.num_patches, 0.75, device)
                 private, shared, mask = model.forward_encoder(sig, 0.75, ids_shuffle, ids_restore, ids_keep)
                 all_private_embs[name] = private
-                all_shared_embs.append(shared)
+                all_shared_embs[name] = shared # Use dict for shared embeddings
                 all_masks[name] = mask
                 all_ids_restore[name] = ids_restore
 
             # Step 2: Create the aligned shared embedding by averaging
-            aligned_shared_emb = torch.stack(all_shared_embs).mean(dim=0)
+            aligned_shared_emb = torch.stack(list(all_shared_embs.values())).mean(dim=0)
 
             # Step 3: Calculate reconstruction loss using the aligned shared embedding
             reconstruction_loss = 0
@@ -220,13 +251,21 @@ def train(args):
                 rec = models[name].forward_decoder(all_private_embs[name], aligned_shared_emb, all_ids_restore[name])
                 reconstruction_loss += models[name].reconstruction_loss(sig, rec, all_masks[name])
 
-            # Step 4: Calculate alignment loss on the original (pre-average) shared embeddings
-            loss_align = 1 - alignment_loss_fn(all_shared_embs[0].mean(dim=1), all_shared_embs[1].mean(dim=1)).mean() + \
-                         1 - alignment_loss_fn(all_shared_embs[0].mean(dim=1), all_shared_embs[2].mean(dim=1)).mean() + \
-                         1 - alignment_loss_fn(all_shared_embs[0].mean(dim=1), all_shared_embs[3].mean(dim=1)).mean()
+            # Step 4: Calculate alignment loss using Hinge Loss
+            # First, get a single vector representation for each signal by averaging patch embeddings
+            all_shared_embs_mean = {k: v.mean(dim=1) for k, v in all_shared_embs.items()}
+            # Then, normalize these summary vectors before passing to loss function
+            normalized_shared_embs = {k: nn.functional.normalize(v, p=2, dim=1) for k, v in all_shared_embs_mean.items()}
+            loss_align = alignment_loss_fn(normalized_shared_embs)
             
             # Step 5: Combine losses
-            loss = reconstruction_loss + args.alignment_loss_weight * loss_align
+            if args.use_curriculum:
+                ratio = (epoch + 1) / args.num_epochs
+                align_weight = np.sin(ratio * np.pi / 2)
+                recon_weight = np.cos(ratio * np.pi / 2)
+                loss = recon_weight * reconstruction_loss + align_weight * loss_align
+            else:
+                loss = reconstruction_loss + args.alignment_loss_weight * loss_align
 
             loss.backward()
             for opt in optimizers.values():
@@ -242,8 +281,9 @@ def train(args):
         avg_train_align_loss = train_align_loss / len(train_dataloader)
         
         # --- Validation Loop ---
-        val_losses = validate(models, val_dataloader, device, args.alignment_loss_weight)
-        logging.info(f"Epoch {epoch+1} | Train Loss: {avg_train_total_loss:.4f} | Val Loss: {val_losses['total']:.4f}")
+        val_losses = validate(models, val_dataloader, device, alignment_loss_fn, args.alignment_loss_weight,
+                              use_curriculum=args.use_curriculum, epoch=epoch, num_epochs=args.num_epochs)
+        logging.info(f"Epoch {epoch+1} | Train Loss: {avg_train_total_loss:.4f} (Align: {avg_train_align_loss:.4f}) | Val Loss: {val_losses['total']:.4f} (Align: {val_losses['align']:.4f})")
 
         # Update learning rate
         for sch in schedulers.values():
@@ -309,13 +349,24 @@ def main():
     # Model specific arguments
     parser.add_argument('--signal_length', type=int, default=3840, help='Length of the input signal windows.')
     parser.add_argument('--patch_window_len', type=int, default=96, help='Length of the patch window for the MAE.')
-
+    parser.add_argument('--embed_dim', type=int, default=128, help='Embedding dimension of the encoder.')
+    parser.add_argument('--depth', type=int, default=8, help='Depth of the encoder.')
+    parser.add_argument('--num_heads', type=int, default=4, help='Number of heads in the encoder.')
+    parser.add_argument('--decoder_embed_dim', type=int, default=128, help='Embedding dimension of the decoder.')
+    parser.add_argument('--decoder_depth', type=int, default=4, help='Depth of the decoder.')
+    parser.add_argument('--decoder_num_heads', type=int, default=4, help='Number of heads in the decoder.')
+    parser.add_argument('--mlp_ratio', type=float, default=4.0, help='MLP ratio for the encoder.')
+    parser.add_argument('--decoder_mlp_ratio', type=float, default=4.0, help='MLP ratio for the decoder.')
+    parser.add_argument('--big_model', action='store_true', help='Use a bigger model configuration.')
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size for training')
     parser.add_argument('--learning_rate', type=float, default=1e-4, help='Learning rate for the optimizer')
     parser.add_argument('--num_epochs', type=int, default=100, help='Number of epochs to train for')
     parser.add_argument('--lr_restart_epochs', type=int, default=20, help='Number of epochs for the first restart in CosineAnnealingWarmRestarts scheduler (T_0).')
     parser.add_argument('--t_mult', type=int, default=1, help='Factor by which to increase T_i after a restart. T_mult=1 is constant.')
     parser.add_argument('--private_mask_ratio', type=float, default=0.5, help='Ratio of private to shared embeddings')
+    parser.add_argument('--hinge_alpha', type=float, default=0.2, help='Margin for the hinge loss.')
+    parser.add_argument('--hinge_neg_sample_percent', type=float, default=None, help='Percentage of hard negatives for hinge loss (0.0 to 1.0). Default is None (use all).')
+    parser.add_argument('--use_curriculum', action='store_true', help='Enable curriculum learning for loss weighting, gradually shifting from reconstruction to alignment.')
     args = parser.parse_args()
 
     setup_logging(args.run_name, args.output_path)
