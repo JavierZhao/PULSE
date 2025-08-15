@@ -349,10 +349,10 @@ def main():
     # Model specific arguments
     parser.add_argument('--signal_length', type=int, default=3840, help='Length of the input signal windows.')
     parser.add_argument('--patch_window_len', type=int, default=96, help='Length of the patch window for the MAE.')
-    parser.add_argument('--embed_dim', type=int, default=128, help='Embedding dimension of the encoder.')
+    parser.add_argument('--embed_dim', type=int, default=1024, help='Embedding dimension of the encoder.')
     parser.add_argument('--depth', type=int, default=8, help='Depth of the encoder.')
     parser.add_argument('--num_heads', type=int, default=4, help='Number of heads in the encoder.')
-    parser.add_argument('--decoder_embed_dim', type=int, default=128, help='Embedding dimension of the decoder.')
+    parser.add_argument('--decoder_embed_dim', type=int, default=512, help='Embedding dimension of the decoder.')
     parser.add_argument('--decoder_depth', type=int, default=4, help='Depth of the decoder.')
     parser.add_argument('--decoder_num_heads', type=int, default=4, help='Number of heads in the decoder.')
     parser.add_argument('--mlp_ratio', type=float, default=4.0, help='MLP ratio for the encoder.')

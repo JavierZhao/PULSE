@@ -88,6 +88,84 @@ def plot_mae_losses(losses_df, path):
     plt.savefig(path)
     plt.close(fig)
 
+def plot_kd_losses(losses_df, path):
+    """
+    Plots and saves KD training curves given a DataFrame with keys:
+      - epoch
+      - train_total, val_total
+      - train_kd_hid, val_kd_hid
+      - train_kd_emb, val_kd_emb
+      - train_recon,   val_recon
+      - val_perp (optional)
+      - lr (optional)
+    """
+    has_perp = 'val_perp' in losses_df.columns
+    has_lr = 'lr' in losses_df.columns
+
+    num_rows = 5 if has_lr else 4
+    if has_perp:
+        num_rows += 1
+
+    fig, axes = plt.subplots(num_rows, 1, figsize=(10, 5 * num_rows), sharex=True)
+    axes = axes if isinstance(axes, (list, tuple, np.ndarray)) else [axes]
+    fig.suptitle('KD Training Curves', fontsize=16)
+
+    row = 0
+    # Total Loss
+    axes[row].plot(losses_df['epoch'], losses_df['train_total'], label='Train Total')
+    axes[row].plot(losses_df['epoch'], losses_df['val_total'], label='Val Total', linestyle='--')
+    axes[row].set_ylabel('Loss')
+    axes[row].set_title('Total Loss')
+    axes[row].legend(); axes[row].grid(True)
+    row += 1
+
+    # Hidden KD Loss
+    if 'train_kd_hid' in losses_df.columns and 'val_kd_hid' in losses_df.columns:
+        axes[row].plot(losses_df['epoch'], losses_df['train_kd_hid'], label='Train KD Hidden')
+        axes[row].plot(losses_df['epoch'], losses_df['val_kd_hid'], label='Val KD Hidden', linestyle='--')
+        axes[row].set_ylabel('Loss')
+        axes[row].set_title('Token-level KD (Hidden Layers)')
+        axes[row].legend(); axes[row].grid(True)
+        row += 1
+
+    # Embedding KD Loss
+    if 'train_kd_emb' in losses_df.columns and 'val_kd_emb' in losses_df.columns:
+        axes[row].plot(losses_df['epoch'], losses_df['train_kd_emb'], label='Train KD Embedding')
+        axes[row].plot(losses_df['epoch'], losses_df['val_kd_emb'], label='Val KD Embedding', linestyle='--')
+        axes[row].set_ylabel('Loss')
+        axes[row].set_title('Pooled Embedding KD (Final Layer)')
+        axes[row].legend(); axes[row].grid(True)
+        row += 1
+
+    # Reconstruction Loss (optional)
+    if 'train_recon' in losses_df.columns and 'val_recon' in losses_df.columns:
+        axes[row].plot(losses_df['epoch'], losses_df['train_recon'], label='Train Recon')
+        axes[row].plot(losses_df['epoch'], losses_df['val_recon'], label='Val Recon', linestyle='--')
+        axes[row].set_ylabel('Loss')
+        axes[row].set_title('Reconstruction Loss')
+        axes[row].legend(); axes[row].grid(True)
+        row += 1
+
+    # Perp Loss (validation only)
+    if has_perp:
+        axes[row].plot(losses_df['epoch'], losses_df['val_perp'], label='Val Perp', color='tab:purple')
+        axes[row].set_ylabel('Loss')
+        axes[row].set_title('Decor Perp (Validation)')
+        axes[row].legend(); axes[row].grid(True)
+        row += 1
+
+    # Learning Rate (optional)
+    if has_lr:
+        axes[row].plot(losses_df['epoch'], losses_df['lr'], label='Learning Rate')
+        axes[row].set_xlabel('Epoch')
+        axes[row].set_ylabel('LR')
+        axes[row].set_title('Learning Rate Schedule')
+        axes[row].legend(); axes[row].grid(True)
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.savefig(path)
+    plt.close(fig)
+
 def plot_single_loss_curve(losses_df, path):
     """
     Plots and saves a single training and validation loss curve.

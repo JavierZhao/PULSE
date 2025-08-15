@@ -9,6 +9,7 @@ import logging
 from tqdm import tqdm
 import pandas as pd
 import numpy as np
+import subprocess
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
@@ -60,19 +61,54 @@ def load_checkpoint(path, model, optimizer, scheduler, device):
     logging.info(f"Resumed from epoch {epoch}. Best validation loss was {best_val_loss:.4f}.")
     return epoch, best_val_loss, losses
 
-def validate(model, dataloader, device):
+def validate(model, dataloader, device, mask_ratio):
     model.eval()
     total_loss = 0
     with torch.no_grad():
         pbar_val = tqdm(dataloader, desc="Validating")
         for batch in pbar_val:
             sig = batch['eda'].to(device)
-            ids_shuffle, ids_restore, ids_keep = model.propose_masking(len(sig), model.num_patches, 0.75, device)
-            private, shared, mask = model.forward_encoder(sig, 0.75, ids_shuffle, ids_restore, ids_keep)
+            ids_shuffle, ids_restore, ids_keep = model.propose_masking(len(sig), model.num_patches, mask_ratio, device)
+            private, shared, mask = model.forward_encoder(sig, mask_ratio, ids_shuffle, ids_restore, ids_keep)
             rec = model.forward_decoder(private, shared, ids_restore)
             loss = model.reconstruction_loss(sig, rec, mask)
             total_loss += loss.item()
     return total_loss / len(dataloader)
+
+def run_periodic_evaluation(run_output_path, models_path, args, epoch_plus_one):
+    """Invoke evaluate_eda_mae.py to generate a reconstruction plot and rename it per-epoch."""
+    ckpt_path = os.path.join(models_path, "best_ckpt.pt")
+    if not os.path.isfile(ckpt_path):
+        logging.info("Periodic evaluation skipped (no best_ckpt.pt yet).")
+        return
+    eval_script = os.path.join(os.path.dirname(__file__), 'evaluate_eda_mae.py')
+    cmd = [
+        sys.executable, eval_script,
+        '--checkpoint_path', ckpt_path,
+        '--data_path', args.data_path,
+        '--output_path', run_output_path,
+        '--fold_number', str(args.fold_number),
+        '--device', args.device,
+        '--signal_length', str(args.signal_length),
+        '--patch_window_len', str(args.patch_window_len),
+    ]
+    try:
+        logging.info(f"Running periodic evaluation at epoch {epoch_plus_one}...")
+        subprocess.run(cmd, check=True)
+        # Rename output plot with epoch suffix if present
+        out_plot = os.path.join(run_output_path, 'eda_reconstruction_example.png')
+        if os.path.isfile(out_plot):
+            new_name = os.path.join(run_output_path, f'eda_reconstruction_example_epoch_{epoch_plus_one}.png')
+            try:
+                if os.path.isfile(new_name):
+                    os.remove(new_name)
+                os.rename(out_plot, new_name)
+                logging.info(f"Saved periodic reconstruction plot to {new_name}")
+            except Exception as re:
+                logging.warning(f"Could not rename reconstruction plot: {re}")
+    except subprocess.CalledProcessError as e:
+        logging.warning(f"Periodic evaluation failed: {e}")
+
 
 def train(args):
     device = torch.device(args.device)
@@ -80,10 +116,14 @@ def train(args):
     models_path = os.path.join(run_output_path, "models")
     os.makedirs(models_path, exist_ok=True)
     
+    if not (0.0 <= args.mask_ratio <= 1.0):
+        raise ValueError(f"mask_ratio must be in [0.0, 1.0], got {args.mask_ratio}")
+    
     model = CheapSensorMAE(
         modality_name='eda',
         sig_len=args.signal_length,
         window_len=args.patch_window_len,
+        private_mask_ratio=1.0
     ).to(device)
     
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
@@ -138,8 +178,8 @@ def train(args):
             sig = batch['eda'].to(device)
             optimizer.zero_grad()
             
-            ids_shuffle, ids_restore, ids_keep = model.propose_masking(len(sig), model.num_patches, 0.75, device)
-            private, shared, mask = model.forward_encoder(sig, 0.75, ids_shuffle, ids_restore, ids_keep)
+            ids_shuffle, ids_restore, ids_keep = model.propose_masking(len(sig), model.num_patches, args.mask_ratio, device)
+            private, shared, mask = model.forward_encoder(sig, args.mask_ratio, ids_shuffle, ids_restore, ids_keep)
             rec = model.forward_decoder(private, shared, ids_restore)
             loss = model.reconstruction_loss(sig, rec, mask)
             
@@ -150,7 +190,7 @@ def train(args):
             pbar_train.set_postfix(Loss=loss.item())
 
         avg_train_loss = train_loss / len(train_dataloader)
-        avg_val_loss = validate(model, val_dataloader, device)
+        avg_val_loss = validate(model, val_dataloader, device, args.mask_ratio)
         
         logging.info(f"Epoch {epoch+1} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
 
@@ -177,6 +217,10 @@ def train(args):
             plot_single_reconstruction(model, vis_sig, recon_plot_path, title=f"EDA Reconstruction Epoch {epoch+1}")
             logging.info(f"Saved reconstruction plot to {recon_plot_path}")
 
+        # Periodic external evaluation using evaluate_eda_mae
+        if args.eval_every > 0 and (epoch + 1) % args.eval_every == 0:
+            run_periodic_evaluation(run_output_path, models_path, args, epoch + 1)
+
     logging.info("Training complete.")
     final_plot_path = os.path.join(run_output_path, "loss_curves.png")
     plot_single_loss_curve(pd.DataFrame(losses), final_plot_path)
@@ -197,10 +241,12 @@ def main():
     # Model specific arguments
     parser.add_argument('--signal_length', type=int, default=3840, help='Length of the input signal windows.')
     parser.add_argument('--patch_window_len', type=int, default=96, help='Length of the patch window for the MAE.')
+    parser.add_argument('--mask_ratio', type=float, default=0.75, help='Fraction of patches to mask during MAE training/validation (0.0 to 1.0).')
 
-    parser.add_argument('--batch_size', type=int, default=32, help='Batch size for training')
+    parser.add_argument('--batch_size', type=int, default=128, help='Batch size for training')
     parser.add_argument('--learning_rate', type=float, default=1e-4, help='Learning rate for the optimizer')
-    parser.add_argument('--num_epochs', type=int, default=100, help='Number of epochs to train for')
+    parser.add_argument('--num_epochs', type=int, default=300, help='Number of epochs to train for')
+    parser.add_argument('--eval_every', type=int, default=10, help='Run evaluate_eda_mae every N epochs (0 to disable)')
     args = parser.parse_args()
 
     setup_logging(args.run_name, args.output_path)

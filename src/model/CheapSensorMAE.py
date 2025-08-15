@@ -111,7 +111,7 @@ class Encoder(nn.Module):
             nn.init.constant_(m.weight, 1.0)
 
     
-    def forward(self, x, mask_ratio, ids_shuffle, ids_restore, ids_keep):
+    def forward(self, x, mask_ratio, ids_shuffle, ids_restore, ids_keep, return_hiddens=False):
         # embed patches
         x = self.patch_embed(x)
 
@@ -127,16 +127,23 @@ class Encoder(nn.Module):
         cls_tokens = cls_token.expand(x.shape[0], -1, -1)
         x = torch.cat((cls_tokens, x), dim=1)
 
+        hiddens = []
+
         # apply Transformer blocks
         for blk in self.blocks:
             x = blk(x)
+            if return_hiddens:
+                hiddens.append(x)
+
         x = self.norm(x)
         
         # Use the fixed private mask
         private_embedding = x * self.private_mask
         shared_embedding = x * (1 - self.private_mask)
-        
-        return private_embedding, shared_embedding, mask
+        if return_hiddens:
+            return private_embedding, shared_embedding, mask, hiddens
+        else:
+            return private_embedding, shared_embedding, mask
 
     def perform_masking(self, x, mask_ratio, ids_restore, ids_keep):
         """
