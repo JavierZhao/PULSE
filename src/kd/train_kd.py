@@ -266,6 +266,8 @@ def validate(batch_iter, students, teacher, kd_heads, layers_to_match, layer_map
         model.eval()
     teacher.eval()
 
+    modality_names = list(students.keys())
+
     total_kd_hid = 0.0
     total_kd_emb = 0.0
     total_recon = 0.0
@@ -273,11 +275,8 @@ def validate(batch_iter, students, teacher, kd_heads, layers_to_match, layer_map
     count = 0
 
     for batch in batch_iter:
-        ecg = batch['ecg'].to(device)
-        bvp = batch['bvp'].to(device)
-        acc = batch['acc'].to(device)
-        temp = batch['temp'].to(device)
         eda = batch['eda'].to(device)
+        signals = {name: batch[name].to(device) for name in modality_names}
 
         # Forward teacher and students once for hidden and final tokens
         Ht_list, _, T_final_private = get_hidden_and_final_tokens(teacher, eda, mask_ratio=0.0, device=device)
@@ -296,7 +295,7 @@ def validate(batch_iter, students, teacher, kd_heads, layers_to_match, layer_map
         Hs_hidden = {}
         Hs_final_shared = {}
         Hs_final_private = {}
-        for name, x in [('ecg', ecg), ('bvp', bvp), ('acc', acc), ('temp', temp)]:
+        for name, x in signals.items():
             hs, hf_shared, hf_private = get_hidden_and_final_tokens(students[name], x, mask_ratio=0.0, device=device)
             Hs_hidden[name] = hs
             Hs_final_shared[name] = hf_shared
@@ -323,8 +322,9 @@ def validate(batch_iter, students, teacher, kd_heads, layers_to_match, layer_map
             t_idx = layer_map[l]
             T_tokens = kd_heads.project_teacher(Ht_list[t_idx])
 
-            # Align time length
-            T_tokens = linear_time_align(T_tokens, target_T=S_dict['ecg'].size(1))
+            # Align time length using any available student modality's token length
+            any_mod = next(iter(S_dict.values()))
+            T_tokens = linear_time_align(T_tokens, target_T=any_mod.size(1))
 
             # Fuse
             S_fuse = kd_heads.fuse_shared(S_dict)
@@ -354,7 +354,7 @@ def validate(batch_iter, students, teacher, kd_heads, layers_to_match, layer_map
         # Optional reconstruction
         if args.recon_weight > 0.0:
             recon_loss = 0.0
-            for name, x in [('ecg', ecg), ('bvp', bvp), ('acc', acc), ('temp', temp)]:
+            for name, x in signals.items():
                 ids_shuffle, ids_restore, ids_keep = students[name].propose_masking(len(x), students[name].num_patches, args.mask_ratio, device)
                 private, shared, mask = students[name].forward_encoder(x, args.mask_ratio, ids_shuffle, ids_restore, ids_keep)
                 rec = students[name].forward_decoder(private, shared, ids_restore)
@@ -384,6 +384,19 @@ def train(args):
     models_path = os.path.join(run_output_path, "models")
     os.makedirs(models_path, exist_ok=True)
 
+    # Determine which student modalities to include
+    if getattr(args, 'modalities', 'all') == 'all':
+        student_modalities = ['ecg', 'bvp', 'acc', 'temp']
+    else:
+        parsed = [m.strip().lower() for m in args.modalities.split(',') if m.strip()]
+        allowed = {'ecg', 'bvp', 'acc', 'temp'}
+        invalid = [m for m in parsed if m not in allowed]
+        if len(invalid) > 0:
+            raise ValueError(f"Invalid modalities specified for KD students: {invalid}. Allowed: {sorted(list(allowed))}")
+        if len(parsed) == 0:
+            raise ValueError("No valid student modalities specified. Provide at least one of {ecg,bvp,acc,temp}.")
+        student_modalities = parsed
+
     # Instantiate teacher and students
     teacher = CheapSensorMAE(
         modality_name='eda',
@@ -396,24 +409,20 @@ def train(args):
     for p in teacher.parameters():
         p.requires_grad_(False)
 
-    students = {
-        'ecg': CheapSensorMAE(modality_name='ecg', sig_len=args.signal_length, window_len=args.patch_window_len,
-                              embed_dim=args.embed_dim, depth=args.depth, num_heads=args.num_heads,
-                              decoder_embed_dim=args.decoder_embed_dim, decoder_depth=args.decoder_depth, decoder_num_heads=args.decoder_num_heads,
-                              mlp_ratio=args.mlp_ratio, decoder_mlp_ratio=args.decoder_mlp_ratio, private_mask_ratio=args.private_mask_ratio).to(device),
-        'bvp': CheapSensorMAE(modality_name='bvp', sig_len=args.signal_length, window_len=args.patch_window_len,
-                              embed_dim=args.embed_dim, depth=args.depth, num_heads=args.num_heads,
-                              decoder_embed_dim=args.decoder_embed_dim, decoder_depth=args.decoder_depth, decoder_num_heads=args.decoder_num_heads,
-                              mlp_ratio=args.mlp_ratio, decoder_mlp_ratio=args.decoder_mlp_ratio, private_mask_ratio=args.private_mask_ratio).to(device),
-        'acc': CheapSensorMAE(modality_name='acc', sig_len=args.signal_length, window_len=args.patch_window_len,
-                              embed_dim=args.embed_dim, depth=args.depth, num_heads=args.num_heads,
-                              decoder_embed_dim=args.decoder_embed_dim, decoder_depth=args.decoder_depth, decoder_num_heads=args.decoder_num_heads,
-                              mlp_ratio=args.mlp_ratio, decoder_mlp_ratio=args.decoder_mlp_ratio, private_mask_ratio=args.private_mask_ratio).to(device),
-        'temp': CheapSensorMAE(modality_name='temp', sig_len=args.signal_length, window_len=args.patch_window_len,
-                               embed_dim=args.embed_dim, depth=args.depth, num_heads=args.num_heads,
-                               decoder_embed_dim=args.decoder_embed_dim, decoder_depth=args.decoder_depth, decoder_num_heads=args.decoder_num_heads,
-                               mlp_ratio=args.mlp_ratio, decoder_mlp_ratio=args.decoder_mlp_ratio, private_mask_ratio=args.private_mask_ratio).to(device),
-    }
+    students = {name: CheapSensorMAE(
+        modality_name=name,
+        sig_len=args.signal_length,
+        window_len=args.patch_window_len,
+        embed_dim=args.embed_dim,
+        depth=args.depth,
+        num_heads=args.num_heads,
+        decoder_embed_dim=args.decoder_embed_dim,
+        decoder_depth=args.decoder_depth,
+        decoder_num_heads=args.decoder_num_heads,
+        mlp_ratio=args.mlp_ratio,
+        decoder_mlp_ratio=args.decoder_mlp_ratio,
+        private_mask_ratio=args.private_mask_ratio,
+    ).to(device) for name in student_modalities}
 
     # Load checkpoints
     if args.teacher_ckpt_path is not None and os.path.isfile(args.teacher_ckpt_path):
@@ -496,6 +505,7 @@ def train(args):
     logging.info("Configuration:")
     for key, value in vars(args).items():
         logging.info(f"  {key}: {value}")
+    logging.info(f"Student modalities: {list(students.keys())}")
     logging.info("\nModel Architecture:")
     logging.info(str(kd_heads))
     logging.info(f"Total parameters: {sum(p.numel() for p in kd_heads.parameters()):,}")
@@ -524,11 +534,8 @@ def train(args):
         logged_variance = False
 
         for batch in pbar:
-            ecg = batch['ecg'].to(device)
-            bvp = batch['bvp'].to(device)
-            acc = batch['acc'].to(device)
-            temp = batch['temp'].to(device)
             eda = batch['eda'].to(device)
+            signals = {name: batch[name].to(device) for name in students.keys()}
 
             optimizer.zero_grad()
 
@@ -549,7 +556,7 @@ def train(args):
             Hs_hidden = {}
             Hs_final_shared = {}
             Hs_final_private = {}
-            for name, x in [('ecg', ecg), ('bvp', bvp), ('acc', acc), ('temp', temp)]:
+            for name, x in signals.items():
                 hs, hf_shared, hf_private = get_hidden_and_final_tokens(students[name], x, mask_ratio=0.0, device=device)
                 Hs_hidden[name] = hs
                 Hs_final_shared[name] = hf_shared
@@ -573,7 +580,8 @@ def train(args):
                 
                 t_idx = layer_map[l]
                 T_tokens = kd_heads.project_teacher(Ht_list[t_idx])
-                T_tokens = linear_time_align(T_tokens, target_T=S_dict['ecg'].size(1))
+                any_mod = next(iter(S_dict.values()))
+                T_tokens = linear_time_align(T_tokens, target_T=any_mod.size(1))
 
                 # Fusion
                 S_fuse = kd_heads.fuse_shared(S_dict)
@@ -603,7 +611,7 @@ def train(args):
             # Optional reconstruction
             if args.recon_weight > 0.0:
                 recon_loss = 0.0
-                for name, x in [('ecg', ecg), ('bvp', bvp), ('acc', acc), ('temp', temp)]:
+                for name, x in signals.items():
                     ids_shuffle, ids_restore, ids_keep = students[name].propose_masking(len(x), students[name].num_patches, args.mask_ratio, device)
                     private, shared, mask = students[name].forward_encoder(x, args.mask_ratio, ids_shuffle, ids_restore, ids_keep)
                     rec = students[name].forward_decoder(private, shared, ids_restore)
@@ -723,6 +731,8 @@ def main():
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--dataset_percentage', type=float, default=1.0)
     parser.add_argument('--device', type=str, default='cuda:0' if torch.cuda.is_available() else 'cpu')
+    # Modalities selection (like pretrain/finetune)
+    parser.add_argument('--modalities', type=str, default='all', help='Comma-separated list of student modalities from {ecg,bvp,acc,temp}, or "all"')
 
     # Model sizes
     parser.add_argument('--signal_length', type=int, default=3840)
