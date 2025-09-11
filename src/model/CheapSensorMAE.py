@@ -111,7 +111,7 @@ class Encoder(nn.Module):
             nn.init.constant_(m.weight, 1.0)
 
     
-    def forward(self, x, mask_ratio, ids_shuffle, ids_restore, ids_keep):
+    def forward(self, x, mask_ratio, ids_shuffle, ids_restore, ids_keep, return_hiddens=False):
         # embed patches
         x = self.patch_embed(x)
 
@@ -127,16 +127,23 @@ class Encoder(nn.Module):
         cls_tokens = cls_token.expand(x.shape[0], -1, -1)
         x = torch.cat((cls_tokens, x), dim=1)
 
+        hiddens = []
+
         # apply Transformer blocks
         for blk in self.blocks:
             x = blk(x)
+            if return_hiddens:
+                hiddens.append(x)
+
         x = self.norm(x)
         
         # Use the fixed private mask
         private_embedding = x * self.private_mask
         shared_embedding = x * (1 - self.private_mask)
-        
-        return private_embedding, shared_embedding, mask
+        if return_hiddens:
+            return private_embedding, shared_embedding, mask, hiddens
+        else:
+            return private_embedding, shared_embedding, mask
 
     def perform_masking(self, x, mask_ratio, ids_restore, ids_keep):
         """
@@ -240,9 +247,9 @@ class CheapSensorMAE(nn.Module):
     """ Masked Autoencoder with VisionTransformer backbone
     """
     def __init__(self, modality_name, sig_len=2500, window_len=100, in_chans=1,
-                 embed_dim=1024, embed_squeeze=0.5, depth=8, num_heads=8,
+                 embed_dim=1024, depth=8, num_heads=8,
                  decoder_embed_dim=512, decoder_depth=4, decoder_num_heads=16,
-                 mlp_ratio=4., norm_layer=nn.LayerNorm, norm_pix_loss=True, private_mask_ratio=0.5):
+                 mlp_ratio=4., decoder_mlp_ratio=4.0, norm_layer=nn.LayerNorm, norm_pix_loss=True, private_mask_ratio=0.5):
         super().__init__()
 
         # --------------------------------------------------------------------------
@@ -264,7 +271,7 @@ class CheapSensorMAE(nn.Module):
 
         #self.correlator = Correlator(channel_id, embed_dim, embed_squeeze)
 
-        self.decoder = Decoder(in_chans, self.window_len, self.num_patches, embed_dim, decoder_embed_dim, decoder_depth, decoder_num_heads, mlp_ratio, norm_layer)
+        self.decoder = Decoder(in_chans, self.window_len, self.num_patches, embed_dim, decoder_embed_dim, decoder_depth, decoder_num_heads, decoder_mlp_ratio, norm_layer)
 
         
         # --------------------------------------------------------------------------

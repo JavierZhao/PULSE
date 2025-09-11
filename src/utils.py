@@ -44,45 +44,145 @@ def visualize_reconstruction(model, signal, title="MAE Reconstruction"):
 
 def plot_mae_losses(losses_df, path):
     """
-    Plots and saves the training and validation loss curves for the MAE model.
-    The plot will contain four subplots for total, reconstruction, and alignment losses, and learning rate.
+    Plots MAE training/validation curves. Expected columns:
+      - epoch, train_total_loss, val_total_loss
+      - train_recon_loss, val_recon_loss
+      - train_align_loss, val_align_loss
+      - train_disent_loss, val_disent_loss (optional)
+      - lr (optional)
     """
-    fig, axes = plt.subplots(4, 1, figsize=(10, 20), sharex=True)
+    has_disent = 'train_disent_loss' in losses_df.columns and 'val_disent_loss' in losses_df.columns
+    has_lr = 'lr' in losses_df.columns
+
+    num_rows = 3  # total, recon, align
+    if has_disent:
+        num_rows += 1
+    if has_lr:
+        num_rows += 1
+
+    fig, axes = plt.subplots(num_rows, 1, figsize=(10, 5 * num_rows), sharex=True)
+    axes = axes if isinstance(axes, (list, tuple, np.ndarray)) else [axes]
     fig.suptitle('MAE Training Curves', fontsize=16)
 
-    # Plot Total Loss
-    axes[0].plot(losses_df['epoch'], losses_df['train_total_loss'], label='Train Total Loss')
-    axes[0].plot(losses_df['epoch'], losses_df['val_total_loss'], label='Validation Total Loss', linestyle='--')
-    axes[0].set_ylabel('Loss')
-    axes[0].set_title('Total Loss')
-    axes[0].legend()
-    axes[0].grid(True)
+    row = 0
+    # Total Loss
+    axes[row].plot(losses_df['epoch'], losses_df['train_total_loss'], label='Train Total Loss')
+    axes[row].plot(losses_df['epoch'], losses_df['val_total_loss'], label='Validation Total Loss', linestyle='--')
+    axes[row].set_ylabel('Loss')
+    axes[row].set_title('Total Loss')
+    axes[row].legend(); axes[row].grid(True)
+    row += 1
 
-    # Plot Reconstruction Loss
-    axes[1].plot(losses_df['epoch'], losses_df['train_recon_loss'], label='Train Reconstruction Loss')
-    axes[1].plot(losses_df['epoch'], losses_df['val_recon_loss'], label='Validation Reconstruction Loss', linestyle='--')
-    axes[1].set_ylabel('Loss')
-    axes[1].set_title('Reconstruction Loss')
-    axes[1].legend()
-    axes[1].grid(True)
+    # Reconstruction Loss
+    axes[row].plot(losses_df['epoch'], losses_df['train_recon_loss'], label='Train Reconstruction Loss')
+    axes[row].plot(losses_df['epoch'], losses_df['val_recon_loss'], label='Validation Reconstruction Loss', linestyle='--')
+    axes[row].set_ylabel('Loss')
+    axes[row].set_title('Reconstruction Loss')
+    axes[row].legend(); axes[row].grid(True)
+    row += 1
 
-    # Plot Alignment Loss
-    axes[2].plot(losses_df['epoch'], losses_df['train_align_loss'], label='Train Alignment Loss')
-    axes[2].plot(losses_df['epoch'], losses_df['val_align_loss'], label='Validation Alignment Loss', linestyle='--')
-    axes[2].set_xlabel('Epoch')
-    axes[2].set_ylabel('Loss')
-    axes[2].set_title('Alignment Loss')
-    axes[2].legend()
-    axes[2].grid(True)
+    # Alignment Loss
+    axes[row].plot(losses_df['epoch'], losses_df['train_align_loss'], label='Train Alignment Loss')
+    axes[row].plot(losses_df['epoch'], losses_df['val_align_loss'], label='Validation Alignment Loss', linestyle='--')
+    axes[row].set_ylabel('Loss')
+    axes[row].set_title('Alignment Loss')
+    axes[row].legend(); axes[row].grid(True)
+    row += 1
 
-    # Plot Learning Rate
-    axes[3].plot(losses_df['epoch'], losses_df['lr'], label='Learning Rate')
-    axes[3].set_xlabel('Epoch')
-    axes[3].set_ylabel('Learning Rate')
-    axes[3].set_title('Learning Rate Schedule')
-    axes[3].legend()
-    axes[3].grid(True)
+    # Disentangling Loss (optional)
+    if has_disent:
+        axes[row].plot(losses_df['epoch'], losses_df['train_disent_loss'], label='Train Disentangling Loss')
+        axes[row].plot(losses_df['epoch'], losses_df['val_disent_loss'], label='Validation Disentangling Loss', linestyle='--')
+        axes[row].set_ylabel('Loss')
+        axes[row].set_title('Disentangling Loss')
+        axes[row].legend(); axes[row].grid(True)
+        row += 1
 
+    # Learning Rate (optional)
+    if has_lr:
+        axes[row].plot(losses_df['epoch'], losses_df['lr'], label='Learning Rate')
+        axes[row].set_xlabel('Epoch')
+        axes[row].set_ylabel('Learning Rate')
+        axes[row].set_title('Learning Rate Schedule')
+        axes[row].legend(); axes[row].grid(True)
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.savefig(path)
+    plt.close(fig)
+
+def plot_kd_losses(losses_df, path):
+    """
+    Plots and saves KD training curves given a DataFrame with keys:
+      - epoch
+      - train_total, val_total
+      - train_kd_hid, val_kd_hid
+      - train_kd_emb, val_kd_emb
+      - train_recon,   val_recon
+      - val_perp (optional)
+      - lr (optional)
+    """
+    has_perp = 'val_perp' in losses_df.columns
+    has_lr = 'lr' in losses_df.columns
+
+    num_rows = 5 if has_lr else 4
+    if has_perp:
+        num_rows += 1
+
+    fig, axes = plt.subplots(num_rows, 1, figsize=(10, 5 * num_rows), sharex=True)
+    axes = axes if isinstance(axes, (list, tuple, np.ndarray)) else [axes]
+    fig.suptitle('KD Training Curves', fontsize=16)
+
+    row = 0
+    # Total Loss
+    axes[row].plot(losses_df['epoch'], losses_df['train_total'], label='Train Total')
+    axes[row].plot(losses_df['epoch'], losses_df['val_total'], label='Val Total', linestyle='--')
+    axes[row].set_ylabel('Loss')
+    axes[row].set_title('Total Loss')
+    axes[row].legend(); axes[row].grid(True)
+    row += 1
+
+    # Hidden KD Loss
+    if 'train_kd_hid' in losses_df.columns and 'val_kd_hid' in losses_df.columns:
+        axes[row].plot(losses_df['epoch'], losses_df['train_kd_hid'], label='Train KD Hidden')
+        axes[row].plot(losses_df['epoch'], losses_df['val_kd_hid'], label='Val KD Hidden', linestyle='--')
+        axes[row].set_ylabel('Loss')
+        axes[row].set_title('Token-level KD (Hidden Layers)')
+        axes[row].legend(); axes[row].grid(True)
+        row += 1
+
+    # Embedding KD Loss
+    if 'train_kd_emb' in losses_df.columns and 'val_kd_emb' in losses_df.columns:
+        axes[row].plot(losses_df['epoch'], losses_df['train_kd_emb'], label='Train KD Embedding')
+        axes[row].plot(losses_df['epoch'], losses_df['val_kd_emb'], label='Val KD Embedding', linestyle='--')
+        axes[row].set_ylabel('Loss')
+        axes[row].set_title('Pooled Embedding KD (Final Layer)')
+        axes[row].legend(); axes[row].grid(True)
+        row += 1
+
+    # Reconstruction Loss (optional)
+    if 'train_recon' in losses_df.columns and 'val_recon' in losses_df.columns:
+        axes[row].plot(losses_df['epoch'], losses_df['train_recon'], label='Train Recon')
+        axes[row].plot(losses_df['epoch'], losses_df['val_recon'], label='Val Recon', linestyle='--')
+        axes[row].set_ylabel('Loss')
+        axes[row].set_title('Reconstruction Loss')
+        axes[row].legend(); axes[row].grid(True)
+        row += 1
+
+    # Perp Loss (validation only)
+    if has_perp:
+        axes[row].plot(losses_df['epoch'], losses_df['val_perp'], label='Val Perp', color='tab:purple')
+        axes[row].set_ylabel('Loss')
+        axes[row].set_title('Decor Perp (Validation)')
+        axes[row].legend(); axes[row].grid(True)
+        row += 1
+
+    # Learning Rate (optional)
+    if has_lr:
+        axes[row].plot(losses_df['epoch'], losses_df['lr'], label='Learning Rate')
+        axes[row].set_xlabel('Epoch')
+        axes[row].set_ylabel('LR')
+        axes[row].set_title('Learning Rate Schedule')
+        axes[row].legend(); axes[row].grid(True)
 
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     plt.savefig(path)
@@ -140,7 +240,10 @@ def plot_reconstructions(models, data_batch, device, output_path):
     """
     Plots and saves a comparison of original vs. reconstructed signals for each modality.
     """
-    fig, axes = plt.subplots(len(models), 1, figsize=(15, 12))
+    num_rows = len(models)
+    fig, axes = plt.subplots(num_rows, 1, figsize=(15, 4 * num_rows))
+    if not isinstance(axes, (list, tuple, np.ndarray)):
+        axes = [axes]
     fig.suptitle('Signal Reconstructions', fontsize=16)
     
     # Take the first sample from the batch for visualization

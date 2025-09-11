@@ -9,8 +9,8 @@ import argparse
 
 # --- Configuration ---
 TARGET_FS = 64  # Hz
-WINDOW_SECONDS = 60
-STRIDE_SECONDS = 0.25
+WINDOW_SECONDS = 10
+STRIDE_SECONDS = 10
 
 # Original sampling rates of the WESAD sensors
 NATIVE_FS = {
@@ -23,7 +23,7 @@ NATIVE_FS = {
 # Paths
 DATA_DIR = '/fd24T/zzhao3/EDA/data'
 WESAD_PKL_DIR = '/fd24T/zzhao3/EDA/data/WESAD'
-OUTPUT_DIR = '/fd24T/zzhao3/EDA/preprocessed_data/60s_0.25s'
+OUTPUT_DIR = '/fd24T/zzhao3/EDA/preprocessed_data/10s_10s_sid'
 SUBJECT_IDS = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17]
 
 
@@ -284,6 +284,18 @@ def process_subject(subject_id):
         print(f"  - Skipping S{subject_id}: {e}")
         return np.array([]), np.array([]), {}
 
+def get_subject_ids_for_windows(cache_data, subject_ids_to_collect):
+    """
+    Collects an array of subject IDs corresponding to each window
+    in a concatenated data array.
+    """
+    sids = []
+    for sid in subject_ids_to_collect:
+        if cache_data[sid]['X'].size > 0:
+            num_windows = cache_data[sid]['X'].shape[0]
+            sids.extend([sid] * num_windows)
+    return np.array(sids)
+
 def main():
     """Run LOSO preprocessing and save one .npz file per fold."""
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -316,10 +328,10 @@ def main():
             print("  · Skipping: no test data.")
             continue
 
+        train_sids = [sid for sid in SUBJECT_IDS if sid != test_sid]
+        
         train_X, train_L = [], []
-        for train_sid in SUBJECT_IDS:
-            if train_sid == test_sid:
-                continue
+        for train_sid in train_sids:
             if cache[train_sid]['X'].size:
                 train_X.append(cache[train_sid]['X'])
                 train_L.append(cache[train_sid]['L'])
@@ -336,6 +348,10 @@ def main():
         
         feature_names = list(test_data['cols'])
         try:
+            # Create subject ID arrays for train and test sets
+            S_train = get_subject_ids_for_windows(cache, train_sids)
+            S_test = np.array([test_sid] * len(L_test))
+            
             eda_channel_index = feature_names.index('eda')
             Y_train = X_train_all[:, :, eda_channel_index]
             Y_test = X_test_all[:, :, eda_channel_index]
@@ -346,12 +362,13 @@ def main():
             print("  - Warning: 'eda' channel not found. Cannot create Y target.")
             Y_train, Y_test = np.array([]), np.array([])
             X_train, X_test = X_train_all, X_test_all
+            S_train, S_test = np.array([]), np.array([]) # Also create empty subject arrays
 
         fold_path = os.path.join(OUTPUT_DIR, f'fold_{test_sid}.npz')
         np.savez_compressed(
             fold_path,
-            X_train=X_train, Y_train=Y_train, L_train=L_train,
-            X_test=X_test, Y_test=Y_test, L_test=L_test,
+            X_train=X_train, Y_train=Y_train, L_train=L_train, S_train=S_train,
+            X_test=X_test, Y_test=Y_test, L_test=L_test, S_test=S_test,
             test_subject_stats=test_stats,
             feature_names=feature_names
         )
