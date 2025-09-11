@@ -79,7 +79,10 @@ def load_checkpoint(path, students, kd_heads, optimizer, scheduler, device):
     checkpoint = torch.load(path, map_location=device)
     for name, model in students.items():
         model.load_state_dict(checkpoint[f'{name}_model_state_dict'])
-    kd_heads.load_state_dict(checkpoint['kd_heads_state_dict'])
+    # Allow for backward-compatibility if KDHeads structure changed (e.g., removed teacher projector)
+    missing, unexpected = kd_heads.load_state_dict(checkpoint['kd_heads_state_dict'], strict=False)
+    if len(missing) > 0 or len(unexpected) > 0:
+        logging.warning(f"KDHeads state_dict loaded with missing keys: {missing} and unexpected keys: {unexpected}")
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     if scheduler is not None and checkpoint.get('scheduler_state_dict') is not None:
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
@@ -97,25 +100,91 @@ def linear_time_align(tokens, target_T):
     return F.interpolate(tokens.transpose(1, 2), size=target_T, mode='linear', align_corners=False).transpose(1, 2)
 
 
-def cosine_token_loss(a, b, mask=None):
+def hinge_token_loss(a, b, mask=None, alpha: float = 0.2):
     # a,b: (B, T, d)
+    # Hinge-style ranking loss across the batch at each token position t
+    # Encourages matching student-teacher pairs to be higher than mismatched pairs by margin alpha
     a = F.normalize(a, dim=-1)
     b = F.normalize(b, dim=-1)
-    sim = (a * b).sum(dim=-1)  # (B, T)
-    loss = 1.0 - sim
+
+    # Optional simple masked positive-only hinge (fallback); not used in current training flow
     if mask is not None:
+        pos_sim = (a * b).sum(dim=-1)  # (B, T)
+        loss = F.relu(alpha - pos_sim)
         loss = loss * mask  # mask shape (B, T)
         denom = mask.sum() + 1e-6
         return loss.sum() / denom
-    return loss.mean()
+
+    # Compute per-token similarity matrices across the batch
+    # Shape transform to (T, B, d)
+    a_t = a.transpose(0, 1)
+    b_t = b.transpose(0, 1)
+
+    # (T, B, B): for each token index t, similarities between all batch pairs
+    sim_mats = torch.bmm(a_t, b_t.transpose(1, 2))
+    # Diagonal sims for each t and batch index
+    diag = sim_mats.diagonal(dim1=1, dim2=2)  # (T, B)
+
+    # Hinge costs in both directions
+    cost_1 = F.relu(alpha - sim_mats + diag.unsqueeze(2))  # (T, B, B)
+    cost_2 = F.relu(alpha - sim_mats.transpose(1, 2) + diag.unsqueeze(2))  # (T, B, B)
+
+    # Zero out diagonal entries (do not count correct pairs as negatives)
+    B = a.size(0)
+    I = torch.eye(B, device=a.device, dtype=torch.bool)
+    cost_1 = cost_1.masked_fill(I.unsqueeze(0), 0.0)
+    cost_2 = cost_2.masked_fill(I.unsqueeze(0), 0.0)
+
+    # Sum over negatives and average by batch size, then average across tokens
+    total = (cost_1.sum(dim=(1, 2)) + cost_2.sum(dim=(1, 2))) / float(B)
+    return total.mean()
+
+
+def hinge_batch_loss(a, b, alpha: float = 0.2):
+    # a,b: (B, d)
+    # Hinge-style ranking loss across the batch
+    a = F.normalize(a, dim=-1)
+    b = F.normalize(b, dim=-1)
+
+    # Similarity matrix and diagonal of positives
+    sim = torch.matmul(a, b.t())  # (B, B)
+    diag = sim.diag()  # (B,)
+
+    # Hinge costs in both directions
+    cost_1 = F.relu(alpha - sim + diag.view(-1, 1))
+    cost_2 = F.relu(alpha - sim.t() + diag.view(-1, 1))
+
+    # Zero out diagonal entries
+    B = a.size(0)
+    I = torch.eye(B, device=a.device, dtype=torch.bool)
+    cost_1 = cost_1.masked_fill(I, 0.0)
+    cost_2 = cost_2.masked_fill(I, 0.0)
+
+    # Sum over negatives and average by batch size
+    return (cost_1.sum() + cost_2.sum()) / float(B)
+
+
+def cosine_token_loss(a, b, mask=None):
+    # Simple cosine similarity loss: 1 - mean cosine between matching pairs
+    # a,b: (B, T, d)
+    a = F.normalize(a, dim=-1)
+    b = F.normalize(b, dim=-1)
+    pos_sim = (a * b).sum(dim=-1)  # (B, T)
+    if mask is not None:
+        denom = mask.sum() + 1e-6
+        mean_sim = (pos_sim * mask).sum() / denom
+    else:
+        mean_sim = pos_sim.mean()
+    return 1.0 - mean_sim
 
 
 def cosine_batch_loss(a, b):
+    # Simple cosine similarity loss for pooled embeddings: 1 - mean cosine
     # a,b: (B, d)
     a = F.normalize(a, dim=-1)
     b = F.normalize(b, dim=-1)
-    sim = (a * b).sum(dim=-1)  # (B,)
-    return (1.0 - sim).mean()
+    pos_sim = (a * b).sum(dim=-1)  # (B,)
+    return 1.0 - pos_sim.mean()
 
 
 def cross_covariance_loss(shared, private):
@@ -133,12 +202,18 @@ def cross_covariance_loss(shared, private):
 class KDHeads(nn.Module):
     def __init__(self, student_dim, teacher_dim, shared_dim, private_dim, modalities):
         super().__init__()
-        self.shared_projector = nn.Linear(student_dim, shared_dim, bias=False)
+        self.shared_projector = nn.ModuleDict({m: nn.Linear(student_dim, shared_dim, bias=False) for m in modalities})
         self.private_projector = nn.ModuleDict({m: nn.Linear(student_dim, private_dim, bias=False) for m in modalities})
-        self.teacher_projector = nn.Linear(teacher_dim, shared_dim, bias=False)
         self.fuse_projector = nn.Linear(len(modalities) * shared_dim, shared_dim, bias=False)
         self.pre_ln_student = nn.LayerNorm(student_dim)
         self.pre_ln_teacher = nn.LayerNorm(teacher_dim)
+
+        # Initialize fuse_projector as averaging across modalities: concat([I, I, ..., I]) / M
+        num_modalities = max(1, len(modalities))
+        with torch.no_grad():
+            eye = torch.eye(shared_dim)
+            weight = torch.cat([eye for _ in range(num_modalities)], dim=1) / float(num_modalities)
+            self.fuse_projector.weight.copy_(weight)
 
     def project_student(self, hidden_tokens_by_mod):
         # hidden_tokens_by_mod[m] = (B, T, D)
@@ -146,14 +221,14 @@ class KDHeads(nn.Module):
         P = {}
         for m, H in hidden_tokens_by_mod.items():
             Hn = self.pre_ln_student(H)
-            S[m] = self.shared_projector(Hn)
+            S[m] = self.shared_projector[m](Hn)
             P[m] = self.private_projector[m](Hn)
         return S, P
 
     def project_teacher(self, teacher_tokens):
         # teacher_tokens: (B, T_t, D_t)
-        T = self.teacher_projector(self.pre_ln_teacher(teacher_tokens))
-        return T
+        # No projector: assume teacher_dim == shared_dim; only apply LayerNorm
+        return self.pre_ln_teacher(teacher_tokens)
 
     def fuse_shared(self, S_dict):
         # Concat along last dim then linear fuse
@@ -231,6 +306,14 @@ def validate(batch_iter, students, teacher, kd_heads, layers_to_match, layer_map
         L_emb_fuse = 0.0
         L_perp_total = 0.0
 
+        # Select KD loss functions based on args
+        if getattr(args, 'kd_loss', 'cosine') == 'hinge':
+            token_kd_loss_fn = hinge_token_loss
+            batch_kd_loss_fn = hinge_batch_loss
+        else:
+            token_kd_loss_fn = cosine_token_loss
+            batch_kd_loss_fn = cosine_batch_loss
+
         for l in layers_to_match:
             # Collect student tokens at layer l
             student_tokens = {m: Hs_hidden[m][l] for m in Hs_hidden}
@@ -247,7 +330,7 @@ def validate(batch_iter, students, teacher, kd_heads, layers_to_match, layer_map
             S_fuse = kd_heads.fuse_shared(S_dict)
 
             # Token-level KD
-            L_hid_fuse = L_hid_fuse + cosine_token_loss(S_fuse, T_tokens)
+            L_hid_fuse = L_hid_fuse + token_kd_loss_fn(S_fuse, T_tokens)
 
         # Normalize hidden KD over number of matched layers
         L_hid_fuse = L_hid_fuse / max(1, len(layers_to_match))
@@ -258,7 +341,7 @@ def validate(batch_iter, students, teacher, kd_heads, layers_to_match, layer_map
         T_final_proj = kd_heads.project_teacher(T_final_private)
         s = S_final_fuse.mean(dim=1)
         t = T_final_proj.mean(dim=1)
-        L_emb_fuse = cosine_batch_loss(s, t)
+        L_emb_fuse = batch_kd_loss_fn(s, t)
 
         # Optional decorrelation on last matched hidden layer (validation)
         if args.perp_weight > 0.0 and len(layers_to_match) > 0:
@@ -360,13 +443,15 @@ def train(args):
         dummy = torch.zeros(1, 1, args.signal_length, device=device)
         Ht_hidden, _, _ = get_hidden_and_final_tokens(teacher, dummy, mask_ratio=0.0, device=device)
     teacher_dim = Ht_hidden[0].size(-1)
+    # Resolve shared_dim to align with teacher when unset/non-positive
+    resolved_shared_dim = args.shared_dim if getattr(args, 'shared_dim', -1) and args.shared_dim > 0 else int(teacher_dim)
 
     # KD heads
     # kd_heads = KDHeads(student_dim=args.embed_dim, teacher_dim=args.embed_dim, shared_dim=args.shared_dim, private_dim=args.private_dim, modalities=list(students.keys())).to(device)
     kd_heads = KDHeads(
         student_dim=args.embed_dim,
         teacher_dim=teacher_dim,
-        shared_dim=args.shared_dim,
+        shared_dim=resolved_shared_dim,
         private_dim=args.private_dim,
         modalities=list(students.keys())
     ).to(device)
@@ -376,6 +461,12 @@ def train(args):
     
 
     # Optimizer/scheduler
+    # Freeze fusion projector initially unless unfreeze epoch is 0
+    if getattr(args, 'unfreeze_fuse_projector_epoch', -1) != 0:
+        for p in kd_heads.fuse_projector.parameters():
+            p.requires_grad_(False)
+
+    # Always include KD head parameters in optimizer so they can be unfrozen later
     optim_params = list(kd_heads.parameters())
     for model in students.values():
         optim_params += list(model.parameters())
@@ -415,6 +506,12 @@ def train(args):
         start_epoch, best_val_loss, losses = load_checkpoint(args.resume_from, students, kd_heads, optimizer, scheduler, device)
 
     for epoch in range(start_epoch, args.num_epochs):
+        # Optionally unfreeze fusion projector at the specified epoch (1-based)
+        if getattr(args, 'unfreeze_fuse_projector_epoch', -1) == (epoch + 1):
+            for p in kd_heads.fuse_projector.parameters():
+                p.requires_grad_(True)
+            logging.info(f"Unfroze fusion projector at epoch {epoch+1}.")
+
         for model in students.values():
             model.train()
         teacher.eval()
@@ -424,6 +521,7 @@ def train(args):
         epoch_kd_emb = 0.0
         epoch_recon = 0.0
         num_steps = 0
+        logged_variance = False
 
         for batch in pbar:
             ecg = batch['ecg'].to(device)
@@ -460,6 +558,14 @@ def train(args):
             L_hid_fuse = 0.0
             L_perp_total = 0.0
 
+            # Select KD loss functions based on args
+            if getattr(args, 'kd_loss', 'cosine') == 'hinge':
+                token_kd_loss_fn = hinge_token_loss
+                batch_kd_loss_fn = hinge_batch_loss
+            else:
+                token_kd_loss_fn = cosine_token_loss
+                batch_kd_loss_fn = cosine_batch_loss
+
             for l in layers_to_match:
                 student_tokens = {m: Hs_hidden[m][l] for m in Hs_hidden}  # (B, T, D)
                 S_dict, _ = kd_heads.project_student(student_tokens)
@@ -473,7 +579,15 @@ def train(args):
                 S_fuse = kd_heads.fuse_shared(S_dict)
 
                 # KD losses
-                L_hid_fuse = L_hid_fuse + cosine_token_loss(S_fuse, T_tokens)
+                L_hid_fuse = L_hid_fuse + token_kd_loss_fn(S_fuse, T_tokens)
+
+                # Quick diagnostic variance checks (log once per epoch)
+                if not logged_variance:
+                    with torch.no_grad():
+                        t_std = T_tokens.reshape(-1, T_tokens.size(-1)).std(dim=0).mean().item()
+                        s_std = S_fuse.reshape(-1, S_fuse.size(-1)).std(dim=0).mean().item()
+                    logging.info(f"Teacher token mean-std: {t_std:.4f} | Student fused token mean-std: {s_std:.4f}")
+                    logged_variance = True
             
             # Normalize hidden KD over number of matched layers
             L_hid_fuse = L_hid_fuse / max(1, len(layers_to_match))
@@ -503,7 +617,15 @@ def train(args):
             T_final_proj = kd_heads.project_teacher(T_final_private)
             s = S_final_fuse.mean(dim=1)
             t = T_final_proj.mean(dim=1)
-            L_emb_final = cosine_batch_loss(s, t)
+            L_emb_final = batch_kd_loss_fn(s, t)
+
+            # If no hidden layers were matched, still log variance diagnostics once per epoch using final tokens
+            if not logged_variance and len(layers_to_match) == 0:
+                with torch.no_grad():
+                    t_std = T_final_proj.reshape(-1, T_final_proj.size(-1)).std(dim=0).mean().item()
+                    s_std = S_final_fuse.reshape(-1, S_final_fuse.size(-1)).std(dim=0).mean().item()
+                logging.info(f"Teacher token mean-std: {t_std:.4f} | Student fused token mean-std: {s_std:.4f}")
+                logged_variance = True
 
             loss = args.lambda_hid * L_hid_fuse + args.lambda_emb * L_emb_final + args.recon_weight * recon_loss + args.perp_weight * L_perp_total
 
@@ -616,7 +738,8 @@ def main():
     parser.add_argument('--private_mask_ratio', type=float, default=0.5)
 
     # KD head dims
-    parser.add_argument('--shared_dim', type=int, default=256)
+    # shared_dim: default 0 means "match teacher dim"; we will resolve at runtime
+    parser.add_argument('--shared_dim', type=int, default=0)
     parser.add_argument('--private_dim', type=int, default=256)
 
     # Loss weights
@@ -626,6 +749,9 @@ def main():
     parser.add_argument('--recon_weight', type=float, default=0.0)
     parser.add_argument('--mask_ratio', type=float, default=0.75)
 
+    # KD loss selection
+    parser.add_argument('--kd_loss', type=str, choices=['cosine', 'hinge'], default='cosine', help='KD loss type: cosine similarity (1 - cos) or hinge ranking')
+
     # Layers
     parser.add_argument('--layers_to_match', type=parse_layers, default=[3, 5, 7])
 
@@ -634,6 +760,9 @@ def main():
     parser.add_argument('--learning_rate', type=float, default=1e-4)
     parser.add_argument('--num_epochs', type=int, default=300)
     parser.add_argument('--use_cosine', action='store_true')
+
+    # Training behavior
+    parser.add_argument('--unfreeze_fuse_projector_epoch', type=int, default=-1, help='Epoch at which to unfreeze the fusion projector (1-based). -1 means never unfreeze; 0 means start unfrozen.')
 
     # Checkpoints
     parser.add_argument('--teacher_ckpt_path', type=str, default="/fd24T/zzhao3/EDA/results/eda_mae/300p/models/best_ckpt.pt", help='Path to teacher best_ckpt.pt from EDA MAE training')

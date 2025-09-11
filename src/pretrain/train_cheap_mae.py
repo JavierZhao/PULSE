@@ -18,6 +18,65 @@ from src.data.wesad_dataset import WESADDataset
 from src.utils import plot_mae_losses, plot_reconstructions
 from src.modules.hinge_loss import AllPairsHingeLoss
 
+
+def _choose_modalities(
+    available: list[str],
+    enable_dropout: bool,
+    p_drop_eda: float,
+    p_drop_cheap: float,
+    force_drop_eda: bool = False,
+) -> list[str]:
+    """Stochastically drop EDA and/or cheap sensors while ensuring at least one cheap modality remains.
+
+    - available: list of modality names present in models/batch
+    - enable_dropout: if False, returns available unchanged (unless force_drop_eda)
+    - p_drop_eda: probability to drop EDA if present
+    - p_drop_cheap: independent probability per cheap modality (ecg, bvp, acc, temp)
+    - force_drop_eda: if True, drop EDA deterministically
+    """
+    cheap_modalities = [m for m in ['ecg', 'bvp', 'acc', 'temp'] if m in available]
+    has_eda = 'eda' in available
+
+    kept = set(available)
+
+    # Optionally drop EDA
+    if has_eda:
+        drop_eda = force_drop_eda or (enable_dropout and (torch.rand(()) < p_drop_eda))
+
+        if drop_eda and 'eda' in kept:
+            kept.remove('eda')
+
+    # Optionally drop cheap modalities
+    if enable_dropout and cheap_modalities:
+        for m in cheap_modalities:
+            drop_cheap = (enable_dropout and (torch.rand(()) < p_drop_cheap))
+            if drop_cheap and m in kept:
+                kept.remove(m)
+
+    # Ensure at least one cheap modality remains
+    if not any(m in kept for m in cheap_modalities):
+        # Randomly keep one cheap modality from the originals
+        if cheap_modalities:
+            idx = int(torch.randint(low=0, high=len(cheap_modalities), size=(1,)).item())
+            kept.add(cheap_modalities[idx])
+
+    # Ensure at least two modalities total if possible
+    if len(kept) < 2 and len(available) >= 2:
+        candidates = [m for m in available if m not in kept]
+        if candidates:
+            idx = int(torch.randint(low=0, high=len(candidates), size=(1,)).item())
+            kept.add(candidates[idx])
+
+    # Final safeguard: ensure something remains
+    if not kept:
+        # Prefer to bring back one cheap; otherwise bring back eda if it existed
+        if cheap_modalities:
+            kept.add(cheap_modalities[0])
+        elif has_eda:
+            kept.add('eda')
+
+    return [m for m in available if m in kept]
+
 def setup_logging(run_name, output_path):
     """Configures logging to file and console."""
     log_dir = os.path.join(output_path, run_name)
@@ -74,11 +133,11 @@ def load_checkpoint(path, models, optimizers, schedulers, device):
     logging.info(f"Resumed from epoch {epoch}. Best validation loss was {best_val_loss:.4f}.")
     return epoch, best_val_loss, losses
 
-def validate(models, dataloader, device, alignment_loss_fn, alignment_loss_weight, use_curriculum=False, epoch=0, num_epochs=1):
+def validate(models, dataloader, device, alignment_loss_fn, alignment_loss_weight, disentangling_loss_weight=0.0, use_curriculum=False, epoch=0, num_epochs=1, enable_modality_dropout: bool=False, p_drop_eda: float=0.0, p_drop_cheap: float=0.0, val_without_eda: bool=False, val_with_dropout: bool=False, mask_ratio: float=0.75):
     """Runs a validation loop and returns the average loss."""
     for model in models.values():
         model.eval()
-    total_loss, total_recon_loss, total_align_loss = 0, 0, 0
+    total_loss, total_recon_loss, total_align_loss, total_disent_loss = 0, 0, 0, 0
 
     if use_curriculum:
         ratio = (epoch + 1) / num_epochs
@@ -91,14 +150,22 @@ def validate(models, dataloader, device, alignment_loss_fn, alignment_loss_weigh
     with torch.no_grad():
         pbar_val = tqdm(dataloader, desc="Validating")
         for batch in pbar_val:
-            ecg_sig, bvp_sig, acc_sig, temp_sig = [batch[k].to(device) for k in ('ecg', 'bvp', 'acc', 'temp')]
+            # Build signals dict from a possibly dropped subset of modalities
+            modality_names = list(models.keys())
+            if val_with_dropout:
+                kept_mods = _choose_modalities(modality_names, True, p_drop_eda, p_drop_cheap)
+            elif val_without_eda:
+                kept_mods = [m for m in modality_names if m != 'eda']
+            else:
+                kept_mods = modality_names
+            signals = {name: batch[name].to(device) for name in kept_mods}
             
             # Step 1: Get all embeddings from the encoders
             all_private_embs, all_shared_embs, all_masks, all_ids_restore = {}, {}, {}, {}
-            for name, sig in [('ecg', ecg_sig), ('bvp', bvp_sig), ('acc', acc_sig), ('temp', temp_sig)]:
+            for name, sig in signals.items():
                 model = models[name]
-                ids_shuffle, ids_restore, ids_keep = model.propose_masking(len(sig), model.num_patches, 0.75, device)
-                private, shared, mask = model.forward_encoder(sig, 0.75, ids_shuffle, ids_restore, ids_keep)
+                ids_shuffle, ids_restore, ids_keep = model.propose_masking(len(sig), model.num_patches, mask_ratio, device)
+                private, shared, mask = model.forward_encoder(sig, mask_ratio, ids_shuffle, ids_restore, ids_keep)
                 all_private_embs[name] = private
                 all_shared_embs[name] = shared # Use dict for shared embeddings
                 all_masks[name] = mask
@@ -108,28 +175,61 @@ def validate(models, dataloader, device, alignment_loss_fn, alignment_loss_weigh
             aligned_shared_emb = torch.stack(list(all_shared_embs.values())).mean(dim=0)
             
             # Step 3: Calculate reconstruction loss using the aligned shared embedding
-            reconstruction_loss = 0
-            for name, sig in [('ecg', ecg_sig), ('bvp', bvp_sig), ('acc', acc_sig), ('temp', temp_sig)]:
+            num_kept = max(1, len(signals))
+            reconstruction_loss = 0.0
+            for name, sig in signals.items():
                 rec = models[name].forward_decoder(all_private_embs[name], aligned_shared_emb, all_ids_restore[name])
                 reconstruction_loss += models[name].reconstruction_loss(sig, rec, all_masks[name])
+            reconstruction_loss = reconstruction_loss / num_kept
 
-            # Step 4: Calculate alignment loss using Hinge Loss
+            # Step 4: Calculate alignment loss using Hinge Loss (skip if < 2 modalities)
             # First, get a single vector representation for each signal by averaging patch embeddings
             all_shared_embs_mean = {k: v.mean(dim=1) for k, v in all_shared_embs.items()}
-            # Then, normalize these summary vectors before passing to loss function
-            normalized_shared_embs = {k: nn.functional.normalize(v, p=2, dim=1) for k, v in all_shared_embs_mean.items()}
-            loss_align = alignment_loss_fn(normalized_shared_embs)
+            if len(all_shared_embs_mean) >= 2:
+                # Then, normalize these summary vectors before passing to loss function
+                normalized_shared_embs = {k: nn.functional.normalize(v, p=2, dim=1) for k, v in all_shared_embs_mean.items()}
+                loss_align = alignment_loss_fn(normalized_shared_embs)
+            else:
+                loss_align = torch.tensor(0.0, device=device)
             
-            loss = recon_weight * reconstruction_loss + align_weight * loss_align
+            # Step 4b: Disentangling loss between private and shared embeddings (cosine similarity)
+            # Use only the non-zero parts based on the encoder's fixed private mask to avoid trivial orthogonality
+            all_private_embs_mean = {k: v.mean(dim=1) for k, v in all_private_embs.items()}  # [B, D]
+            if len(all_private_embs_mean) > 0:
+                per_mod_disent = []
+                for k in all_private_embs_mean.keys():
+                    private_mask = models[k].encoder.private_mask  # [D]
+                    private_idx = (private_mask > 0.5).nonzero(as_tuple=True)[0]
+                    shared_idx = (private_mask <= 0.5).nonzero(as_tuple=True)[0]
+
+                    v_p = all_private_embs_mean[k][:, private_idx]
+                    v_s = all_shared_embs_mean[k][:, shared_idx]
+                    # Handle unequal dimensionalities
+                    min_dim = min(v_p.shape[1], v_s.shape[1])
+                    if min_dim == 0:
+                        continue
+                    v_p = v_p[:, :min_dim]
+                    v_s = v_s[:, :min_dim]
+                    v_p = nn.functional.normalize(v_p, p=2, dim=1)
+                    v_s = nn.functional.normalize(v_s, p=2, dim=1)
+                    cos_sim = (v_p * v_s).sum(dim=1)  # [B]
+                    per_mod_disent.append((cos_sim.pow(2)).mean())
+                loss_disent = torch.stack(per_mod_disent).mean() if len(per_mod_disent) > 0 else torch.tensor(0.0, device=device)
+            else:
+                loss_disent = torch.tensor(0.0, device=device)
+            
+            loss = recon_weight * reconstruction_loss + align_weight * loss_align + disentangling_loss_weight * loss_disent
             total_loss += loss.item()
             total_recon_loss += reconstruction_loss.item()
             total_align_loss += loss_align.item()
+            total_disent_loss += loss_disent.item()
 
     avg_total_loss = total_loss / len(dataloader)
     avg_recon_loss = total_recon_loss / len(dataloader)
     avg_align_loss = total_align_loss / len(dataloader)
+    avg_disent_loss = total_disent_loss / len(dataloader)
     
-    return {'total': avg_total_loss, 'recon': avg_recon_loss, 'align': avg_align_loss}
+    return {'total': avg_total_loss, 'recon': avg_recon_loss, 'align': avg_align_loss, 'disent': avg_disent_loss}
 
 
 def train(args):
@@ -147,24 +247,41 @@ def train(args):
         args.num_heads = 8
         args.decoder_num_heads = 8
 
-    models = {
-        'ecg': CheapSensorMAE(modality_name='ecg', sig_len=args.signal_length, window_len=args.patch_window_len, private_mask_ratio=args.private_mask_ratio,
-                              embed_dim=args.embed_dim, depth=args.depth, num_heads=args.num_heads,
-                              decoder_embed_dim=args.decoder_embed_dim, decoder_depth=args.decoder_depth, decoder_num_heads=args.decoder_num_heads,
-                              mlp_ratio=args.mlp_ratio, decoder_mlp_ratio=args.decoder_mlp_ratio).to(device),
-        'bvp': CheapSensorMAE(modality_name='bvp', sig_len=args.signal_length, window_len=args.patch_window_len, private_mask_ratio=args.private_mask_ratio,
-                              embed_dim=args.embed_dim, depth=args.depth, num_heads=args.num_heads,
-                              decoder_embed_dim=args.decoder_embed_dim, decoder_depth=args.decoder_depth, decoder_num_heads=args.decoder_num_heads,
-                              mlp_ratio=args.mlp_ratio, decoder_mlp_ratio=args.decoder_mlp_ratio).to(device),
-        'acc': CheapSensorMAE(modality_name='acc', sig_len=args.signal_length, window_len=args.patch_window_len, private_mask_ratio=args.private_mask_ratio,
-                              embed_dim=args.embed_dim, depth=args.depth, num_heads=args.num_heads,
-                              decoder_embed_dim=args.decoder_embed_dim, decoder_depth=args.decoder_depth, decoder_num_heads=args.decoder_num_heads,
-                              mlp_ratio=args.mlp_ratio, decoder_mlp_ratio=args.decoder_mlp_ratio).to(device),
-        'temp': CheapSensorMAE(modality_name='temp', sig_len=args.signal_length, window_len=args.patch_window_len, private_mask_ratio=args.private_mask_ratio,
-                               embed_dim=args.embed_dim, depth=args.depth, num_heads=args.num_heads,
-                               decoder_embed_dim=args.decoder_embed_dim, decoder_depth=args.decoder_depth, decoder_num_heads=args.decoder_num_heads,
-                               mlp_ratio=args.mlp_ratio, decoder_mlp_ratio=args.decoder_mlp_ratio).to(device)
-    }
+    # Determine modalities to include
+    if getattr(args, 'modalities', 'all') == 'all':
+        modality_names = ['ecg', 'bvp', 'acc', 'temp']
+        if getattr(args, 'include_eda', False):
+            modality_names.append('eda')
+    else:
+        parsed = [m.strip().lower() for m in args.modalities.split(',') if m.strip()]
+        allowed = {'ecg', 'bvp', 'acc', 'temp', 'eda'}
+        invalid = [m for m in parsed if m not in allowed]
+        if len(invalid) > 0:
+            raise ValueError(f"Invalid modalities specified: {invalid}. Allowed: {sorted(list(allowed))}")
+        modality_names = parsed
+        if getattr(args, 'include_eda', False) and 'eda' not in modality_names:
+            modality_names.append('eda')
+
+    logging.info(f"Using modalities: {modality_names}")
+    if len(modality_names) < 2:
+        logging.warning("Only one modality selected. Alignment loss will be skipped in training and validation.")
+
+    models = {}
+    for name in modality_names:
+        models[name] = CheapSensorMAE(
+            modality_name=name,
+            sig_len=args.signal_length,
+            window_len=args.patch_window_len,
+            private_mask_ratio=args.private_mask_ratio,
+            embed_dim=args.embed_dim,
+            depth=args.depth,
+            num_heads=args.num_heads,
+            decoder_embed_dim=args.decoder_embed_dim,
+            decoder_depth=args.decoder_depth,
+            decoder_num_heads=args.decoder_num_heads,
+            mlp_ratio=args.mlp_ratio,
+            decoder_mlp_ratio=args.decoder_mlp_ratio
+        ).to(device)
     optimizers = {name: torch.optim.Adam(model.parameters(), lr=args.learning_rate) for name, model in models.items()}
     schedulers = {name: torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(opt, T_0=args.lr_restart_epochs, T_mult=args.t_mult) for name, opt in optimizers.items()}
 
@@ -178,6 +295,10 @@ def train(args):
         logging.info("Configuration:")
         for key, value in vars(args).items():
             logging.info(f"  {key}: {value}")
+        if args.enable_modality_dropout:
+            logging.info(f"  Modality Dropout: {args.p_drop_eda} for EDA, {args.p_drop_cheap} for cheap modalities")
+        if args.val_with_dropout:
+            logging.info(f"  Validation with Dropout: {args.p_drop_eda} for EDA, {args.p_drop_cheap} for cheap modalities")
         
         # Log model architecture (they are all the same)
         ecg_model = models['ecg']
@@ -221,11 +342,19 @@ def train(args):
         # --- Training Loop ---
         for model in models.values():
             model.train()
-        train_total_loss, train_recon_loss, train_align_loss = 0, 0, 0
+        train_total_loss, train_recon_loss, train_align_loss, train_disent_loss = 0, 0, 0, 0
         pbar_train = tqdm(train_dataloader, desc=f"Training Epoch {epoch+1}")
         
-        for batch in pbar_train:
-            ecg_sig, bvp_sig, acc_sig, temp_sig = [batch[k].to(device) for k in ('ecg', 'bvp', 'acc', 'temp')]
+        for batch_idx, batch in enumerate(pbar_train):
+            # Build signals dict dynamically from available models/modalities with modality dropout
+            modality_names = list(models.keys())
+            kept_mods = _choose_modalities(
+                modality_names,
+                enable_dropout=args.enable_modality_dropout,
+                p_drop_eda=args.p_drop_eda,
+                p_drop_cheap=args.p_drop_cheap,
+            )
+            signals = {name: batch[name].to(device) for name in kept_mods}
             
             # Zero gradients
             for opt in optimizers.values():
@@ -233,10 +362,10 @@ def train(args):
                 
             # Step 1: Get all embeddings from the encoders
             all_private_embs, all_shared_embs, all_masks, all_ids_restore = {}, {}, {}, {}
-            for name, sig in [('ecg', ecg_sig), ('bvp', bvp_sig), ('acc', acc_sig), ('temp', temp_sig)]:
+            for name, sig in signals.items():
                 model = models[name]
-                ids_shuffle, ids_restore, ids_keep = model.propose_masking(len(sig), model.num_patches, 0.75, device)
-                private, shared, mask = model.forward_encoder(sig, 0.75, ids_shuffle, ids_restore, ids_keep)
+                ids_shuffle, ids_restore, ids_keep = model.propose_masking(len(sig), model.num_patches, args.mask_ratio, device)
+                private, shared, mask = model.forward_encoder(sig, args.mask_ratio, ids_shuffle, ids_restore, ids_keep)
                 all_private_embs[name] = private
                 all_shared_embs[name] = shared # Use dict for shared embeddings
                 all_masks[name] = mask
@@ -246,44 +375,83 @@ def train(args):
             aligned_shared_emb = torch.stack(list(all_shared_embs.values())).mean(dim=0)
 
             # Step 3: Calculate reconstruction loss using the aligned shared embedding
-            reconstruction_loss = 0
-            for name, sig in [('ecg', ecg_sig), ('bvp', bvp_sig), ('acc', acc_sig), ('temp', temp_sig)]:
+            num_kept = max(1, len(signals))
+            reconstruction_loss = 0.0
+            for name, sig in signals.items():
                 rec = models[name].forward_decoder(all_private_embs[name], aligned_shared_emb, all_ids_restore[name])
                 reconstruction_loss += models[name].reconstruction_loss(sig, rec, all_masks[name])
+            reconstruction_loss = reconstruction_loss / num_kept
 
-            # Step 4: Calculate alignment loss using Hinge Loss
+            # Step 4: Calculate alignment loss using Hinge Loss (skip if < 2 modalities)
             # First, get a single vector representation for each signal by averaging patch embeddings
             all_shared_embs_mean = {k: v.mean(dim=1) for k, v in all_shared_embs.items()}
-            # Then, normalize these summary vectors before passing to loss function
-            normalized_shared_embs = {k: nn.functional.normalize(v, p=2, dim=1) for k, v in all_shared_embs_mean.items()}
-            loss_align = alignment_loss_fn(normalized_shared_embs)
+            if len(all_shared_embs_mean) >= 2:
+                # Then, normalize these summary vectors before passing to loss function
+                normalized_shared_embs = {k: nn.functional.normalize(v, p=2, dim=1) for k, v in all_shared_embs_mean.items()}
+                loss_align = alignment_loss_fn(normalized_shared_embs)
+            else:
+                loss_align = torch.tensor(0.0, device=device)
             
-            # Step 5: Combine losses
+            # Step 5: Disentangling loss between private and shared embeddings (cosine similarity)
+            # Compare only non-zero parts from the encoder's fixed private mask
+            all_private_embs_mean = {k: v.mean(dim=1) for k, v in all_private_embs.items()}  # [B, D]
+            per_mod_disent = []
+            for k in all_private_embs_mean.keys():
+                private_mask = models[k].encoder.private_mask  # [D]
+                private_idx = (private_mask > 0.5).nonzero(as_tuple=True)[0]
+                shared_idx = (private_mask <= 0.5).nonzero(as_tuple=True)[0]
+
+                v_p = all_private_embs_mean[k][:, private_idx]
+                v_s = all_shared_embs_mean[k][:, shared_idx]
+                min_dim = min(v_p.shape[1], v_s.shape[1])
+                if min_dim == 0:
+                    continue
+                v_p = v_p[:, :min_dim]
+                v_s = v_s[:, :min_dim]
+                v_p = nn.functional.normalize(v_p, p=2, dim=1)
+                v_s = nn.functional.normalize(v_s, p=2, dim=1)
+                cos_sim = (v_p * v_s).sum(dim=1)
+                per_mod_disent.append((cos_sim.pow(2)).mean())
+            loss_disent = torch.stack(per_mod_disent).mean() if len(per_mod_disent) > 0 else torch.tensor(0.0, device=device)
+
+            # Step 6: Combine losses
             if args.use_curriculum:
                 ratio = (epoch + 1) / args.num_epochs
                 align_weight = np.sin(ratio * np.pi / 2)
                 recon_weight = np.cos(ratio * np.pi / 2)
-                loss = recon_weight * reconstruction_loss + align_weight * loss_align
+                loss = recon_weight * reconstruction_loss + align_weight * loss_align + args.disentangling_loss_weight * loss_disent
             else:
-                loss = reconstruction_loss + args.alignment_loss_weight * loss_align
+                loss = reconstruction_loss + args.alignment_loss_weight * loss_align + args.disentangling_loss_weight * loss_disent
 
             loss.backward()
-            for opt in optimizers.values():
-                opt.step()
+            active = set(signals.keys())
+            for name, opt in optimizers.items():
+                if name in active:
+                    opt.step()
+            # Per-iteration scheduler step (CosineAnnealingWarmRestarts expects fractional epoch)
+            frac_epoch = epoch + (batch_idx + 1) / max(1, len(train_dataloader))
+            for sch in schedulers.values():
+                sch.step(frac_epoch)
                 
             train_total_loss += loss.item()
             train_recon_loss += reconstruction_loss.item()
             train_align_loss += loss_align.item()
+            train_disent_loss += loss_disent.item()
             pbar_train.set_postfix(Loss=loss.item())
 
         avg_train_total_loss = train_total_loss / len(train_dataloader)
         avg_train_recon_loss = train_recon_loss / len(train_dataloader)
         avg_train_align_loss = train_align_loss / len(train_dataloader)
+        avg_train_disent_loss = train_disent_loss / len(train_dataloader)
         
         # --- Validation Loop ---
-        val_losses = validate(models, val_dataloader, device, alignment_loss_fn, args.alignment_loss_weight,
-                              use_curriculum=args.use_curriculum, epoch=epoch, num_epochs=args.num_epochs)
-        logging.info(f"Epoch {epoch+1} | Train Loss: {avg_train_total_loss:.4f} (Align: {avg_train_align_loss:.4f}) | Val Loss: {val_losses['total']:.4f} (Align: {val_losses['align']:.4f})")
+        val_losses = validate(models, val_dataloader, device, alignment_loss_fn, args.alignment_loss_weight, args.disentangling_loss_weight,
+                              use_curriculum=args.use_curriculum, epoch=epoch, num_epochs=args.num_epochs,
+                              enable_modality_dropout=args.enable_modality_dropout,
+                              p_drop_eda=args.p_drop_eda, p_drop_cheap=args.p_drop_cheap,
+                              val_without_eda=args.val_without_eda, val_with_dropout=args.val_with_dropout,
+                              mask_ratio=args.mask_ratio)
+        logging.info(f"Epoch {epoch+1} | Train Loss: {avg_train_total_loss:.4f} (Align: {avg_train_align_loss:.4f}, Disent: {avg_train_disent_loss:.4f}) | Val Loss: {val_losses['total']:.4f} (Align: {val_losses['align']:.4f}, Disent: {val_losses['disent']:.4f})")
 
         # Update learning rate
         for sch in schedulers.values():
@@ -293,8 +461,8 @@ def train(args):
         current_lr = schedulers['ecg'].get_last_lr()[0] # Get LR from one of the schedulers
         losses.append({
             'epoch': epoch + 1,
-            'train_total_loss': avg_train_total_loss, 'train_recon_loss': avg_train_recon_loss, 'train_align_loss': avg_train_align_loss,
-            'val_total_loss': val_losses['total'], 'val_recon_loss': val_losses['recon'], 'val_align_loss': val_losses['align'],
+            'train_total_loss': avg_train_total_loss, 'train_recon_loss': avg_train_recon_loss, 'train_align_loss': avg_train_align_loss, 'train_disent_loss': avg_train_disent_loss,
+            'val_total_loss': val_losses['total'], 'val_recon_loss': val_losses['recon'], 'val_align_loss': val_losses['align'], 'val_disent_loss': val_losses['disent'],
             'lr': current_lr
         })
         losses_df = pd.DataFrame(losses)
@@ -344,6 +512,7 @@ def main():
     parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
     parser.add_argument('--dataset_percentage', type=float, default=1.0, help="Percentage of the dataset to use (0.0 to 1.0). Default: 1.0")
     parser.add_argument('--alignment_loss_weight', type=float, default=1.0, help="Weight for the alignment loss component.")
+    parser.add_argument('--disentangling_loss_weight', type=float, default=0.0, help="Weight for the disentangling loss (cosine similarity between private and shared embeddings).")
     parser.add_argument('--device', type=str, default='cuda:15' if torch.cuda.is_available() else 'cpu', help="Specify the device (e.g., 'cuda:0', 'cuda:1', 'cpu')")
     
     # Model specific arguments
@@ -367,6 +536,15 @@ def main():
     parser.add_argument('--hinge_alpha', type=float, default=0.2, help='Margin for the hinge loss.')
     parser.add_argument('--hinge_neg_sample_percent', type=float, default=None, help='Percentage of hard negatives for hinge loss (0.0 to 1.0). Default is None (use all).')
     parser.add_argument('--use_curriculum', action='store_true', help='Enable curriculum learning for loss weighting, gradually shifting from reconstruction to alignment.')
+    parser.add_argument('--include_eda', action='store_true', help='Include EDA modality in pretraining in addition to ecg, bvp, acc, temp.')
+    parser.add_argument('--modalities', type=str, default='all', help='Comma-separated list of modalities from {ecg,bvp,acc,temp,eda}, or "all"')
+    parser.add_argument('--mask_ratio', type=float, default=0.75, help='Patch masking ratio for MAE input.')
+    # Modality dropout controls
+    parser.add_argument('--enable_modality_dropout', action='store_true', help='Enable stochastic dropping of modalities per mini-batch.')
+    parser.add_argument('--p_drop_eda', type=float, default=0.0, help='Probability to drop EDA per mini-batch (if present).')
+    parser.add_argument('--p_drop_cheap', type=float, default=0.0, help='Probability to drop each cheap modality per mini-batch.')
+    parser.add_argument('--val_without_eda', action='store_true', help='During validation, exclude EDA from inputs.')
+    parser.add_argument('--val_with_dropout', action='store_true', help='During validation, apply the same modality dropout as training.')
     args = parser.parse_args()
 
     setup_logging(args.run_name, args.output_path)

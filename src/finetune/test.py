@@ -16,6 +16,7 @@ from sklearn.metrics import (
     precision_score,
     recall_score,
     roc_auc_score,
+    average_precision_score,
     confusion_matrix,
     classification_report,
     roc_curve,
@@ -112,6 +113,31 @@ def extract_modalities_from_state(state_dict: Dict[str, Any]) -> List[str]:
     return [m for m in PREFERRED_MODALITY_ORDER if m in seen] or mods
 
 
+def parse_modalities_arg(modalities_arg: Optional[str], include_eda: bool) -> Optional[List[str]]:
+    """Parse a finetune.py-compatible modalities argument.
+
+    Returns a list of modalities if modalities_arg is provided; otherwise returns None
+    to signal that checkpoint/log inference should be used.
+    """
+    if modalities_arg is None:
+        return None
+    arg = modalities_arg.strip().lower()
+    if arg == 'all':
+        mods = PREFERRED_MODALITY_ORDER.copy()
+        if include_eda and 'eda' not in mods:
+            mods.append('eda')
+        return mods
+    # comma-separated list
+    parsed = [m.strip() for m in arg.split(',') if m.strip()]
+    allowed = {'ecg', 'bvp', 'acc', 'temp', 'eda'}
+    invalid = [m for m in parsed if m not in allowed]
+    if len(invalid) > 0:
+        raise ValueError(f"Invalid modalities specified: {invalid}. Allowed: {sorted(list(allowed))}")
+    if include_eda and 'eda' not in parsed:
+        parsed.append('eda')
+    return parsed
+
+
 def build_model_from_args(
     args_dict: Dict[str, Any],
     device: torch.device,
@@ -169,9 +195,13 @@ def evaluate(model: StressClassifier, dataloader: DataLoader, device: torch.devi
 
     with torch.no_grad():
         for batch in dataloader:
-            ecg, bvp, acc, temp = [batch[k].to(device) for k in ('ecg', 'bvp', 'acc', 'temp')]
+            ecg = batch['ecg'].to(device)
+            bvp = batch['bvp'].to(device)
+            acc = batch['acc'].to(device)
+            temp = batch['temp'].to(device)
+            eda = batch['eda'].to(device) if 'eda' in model.modalities else None
             labels = batch['label'].to(device)
-            logits = model(ecg, bvp, acc, temp).squeeze()
+            logits = model(ecg, bvp, acc, temp, eda).squeeze()
             probs = torch.sigmoid(logits)
             preds = (probs > 0.5).long()
 
@@ -193,6 +223,11 @@ def evaluate(model: StressClassifier, dataloader: DataLoader, device: torch.devi
         metrics['roc_auc'] = float(roc_auc_score(y_true, y_score))
     except Exception:
         metrics['roc_auc'] = None
+
+    try:
+        metrics['auprc'] = float(average_precision_score(y_true, y_score))
+    except Exception:
+        metrics['auprc'] = None
 
     cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
     metrics['confusion_matrix'] = cm.tolist()
@@ -270,7 +305,7 @@ def write_summary_files(run_dir: str, output_prefix: str = 'fold_test'):
             continue
         fold_id = parse_fold_id(fd)
         row = {'fold': fold_id}
-        for key in ['accuracy', 'f1', 'precision', 'recall', 'roc_auc']:
+        for key in ['accuracy', 'f1', 'precision', 'recall', 'roc_auc', 'auprc']:
             row[key] = metrics.get(key, None)
         rows.append(row)
     if not rows:
@@ -292,7 +327,15 @@ def write_summary_files(run_dir: str, output_prefix: str = 'fold_test'):
     summary_df.to_csv(summary_csv, index=False)
 
 
-def evaluate_run_dir(run_dir: str, device: torch.device, batch_size: int, data_path: Optional[str], fold_number: Optional[int]):
+def evaluate_run_dir(
+    run_dir: str,
+    device: torch.device,
+    batch_size: int,
+    data_path: Optional[str],
+    fold_number: Optional[int],
+    include_eda: bool = False,
+    modalities_override: Optional[List[str]] = None,
+):
     log_path = os.path.join(run_dir, 'finetune.log')
     ckpt_path = os.path.join(run_dir, 'best_model.pt')
     if not (os.path.isfile(log_path) and os.path.isfile(ckpt_path)):
@@ -316,13 +359,20 @@ def evaluate_run_dir(run_dir: str, device: torch.device, batch_size: int, data_p
     first_w = state.get('classifier.0.weight', None)
     embed_dim = int(logged_args.get('embed_dim', 1024))
 
-    # Infer modalities from checkpoint, fallback to log
-    ckpt_modalities = extract_modalities_from_state(state)
-    if ckpt_modalities:
-        selected_modalities = ckpt_modalities
+    # Determine modalities to evaluate
+    # Priority: CLI --modalities (finetune-compatible, passed in) -> checkpoint inferred -> log fallback
+    if modalities_override is not None:
+        selected_modalities = modalities_override
     else:
-        mod_from_log = str(logged_args.get('modality', 'all'))
-        selected_modalities = PREFERRED_MODALITY_ORDER.copy() if mod_from_log == 'all' else [mod_from_log]
+        ckpt_modalities = extract_modalities_from_state(state)
+        if ckpt_modalities:
+            selected_modalities = ckpt_modalities
+        else:
+            mod_from_log = str(logged_args.get('modality', 'all'))
+            selected_modalities = PREFERRED_MODALITY_ORDER.copy() if mod_from_log == 'all' else [mod_from_log]
+        # Optionally include EDA encoder during evaluation
+        if include_eda and 'eda' not in selected_modalities:
+            selected_modalities = selected_modalities + ['eda']
 
     only_shared_override = None
     fuse_override = None
@@ -367,23 +417,84 @@ def evaluate_run_dir(run_dir: str, device: torch.device, batch_size: int, data_p
     test_dataset = WESADDataset(data_path=dp, fold_number=fn, split='test')
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
 
-    # Evaluate
+    # Evaluate (base metrics computed at threshold 0.5)
     metrics, y_true, y_score, y_pred, cm = evaluate(model, test_loader, device_t)
+
+    # Load best validation threshold if available
+    best_thr: Optional[float] = None
+    best_thr_path = os.path.join(run_dir, 'best_threshold.txt')
+    if os.path.isfile(best_thr_path):
+        try:
+            with open(best_thr_path, 'r') as f:
+                first_line = f.readline().strip()
+                if first_line:
+                    best_thr = float(first_line)
+        except Exception:
+            best_thr = None
+
+    # Helper to compute threshold-dependent stats
+    def threshold_metrics(threshold: float) -> Dict[str, Any]:
+        preds_t = (y_score >= threshold).astype(int)
+        cm_t = confusion_matrix(y_true, preds_t, labels=[0, 1])
+        return {
+            'threshold': float(threshold),
+            'accuracy': float(accuracy_score(y_true, preds_t)),
+            'f1': float(f1_score(y_true, preds_t, average='binary')),
+            'precision': float(precision_score(y_true, preds_t, zero_division=0)),
+            'recall': float(recall_score(y_true, preds_t, zero_division=0)),
+            'confusion_matrix': cm_t.tolist(),
+            'classification_report': classification_report(y_true, preds_t, digits=4),
+        }
+
+    # Compute metrics at threshold 0.5 (from evaluate) and at best threshold if present
+    metrics_at_0_5 = {
+        'threshold': 0.5,
+        'accuracy': metrics['accuracy'],
+        'f1': metrics['f1'],
+        'precision': metrics['precision'],
+        'recall': metrics['recall'],
+        'confusion_matrix': metrics['confusion_matrix'],
+        'classification_report': metrics['classification_report'],
+    }
+    metrics_at_best = threshold_metrics(best_thr) if best_thr is not None else None
+
+    # Augment metrics dict with threshold-independent and per-threshold sections
+    metrics_out = dict(metrics)
+    metrics_out['auprc'] = metrics.get('auprc', None)
+    metrics_out['metrics_at_0_5'] = metrics_at_0_5
+    if metrics_at_best is not None:
+        metrics_out['metrics_at_best_threshold'] = metrics_at_best
 
     # Save outputs
     metrics_path = os.path.join(run_dir, 'test_metrics.json')
     with open(metrics_path, 'w') as f:
-        json.dump(metrics, f, indent=2)
+        json.dump(metrics_out, f, indent=2)
 
+    # Write classification reports
     with open(os.path.join(run_dir, 'test_classification_report.txt'), 'w') as f:
-        f.write(metrics['classification_report'])
+        f.write(metrics_at_0_5['classification_report'])
+    with open(os.path.join(run_dir, 'test_classification_report_thr_0.5.txt'), 'w') as f:
+        f.write(metrics_at_0_5['classification_report'])
+    if metrics_at_best is not None:
+        with open(os.path.join(run_dir, 'test_classification_report_thr_best.txt'), 'w') as f:
+            f.write(metrics_at_best['classification_report'])
 
+    # Confusion matrices (keep legacy filename for 0.5)
     cm_path = os.path.join(run_dir, 'test_confusion_matrix.png')
-    plot_confusion_matrix(cm, cm_path)
+    plot_confusion_matrix(np.array(metrics_at_0_5['confusion_matrix']), cm_path)
+    plot_confusion_matrix(np.array(metrics_at_0_5['confusion_matrix']), os.path.join(run_dir, 'test_confusion_matrix_thr_0.5.png'))
+    if metrics_at_best is not None:
+        plot_confusion_matrix(np.array(metrics_at_best['confusion_matrix']), os.path.join(run_dir, 'test_confusion_matrix_thr_best.png'))
 
+    # ROC and PR curves
     plot_roc_pr_curves(y_true, y_score, run_dir)
 
-    print(f"[{os.path.basename(run_dir)}] mods={selected_modalities} accuracy={metrics['accuracy']:.4f} f1={metrics['f1']:.4f} roc_auc={metrics['roc_auc']}")
+    # Console summary
+    base_summary = f"[{os.path.basename(run_dir)}] mods={selected_modalities} thr=0.5 accuracy={metrics_at_0_5['accuracy']:.4f} f1={metrics_at_0_5['f1']:.4f} auroc={metrics.get('roc_auc', None)} auprc={metrics.get('auprc', None)}"
+    print(base_summary)
+    if metrics_at_best is not None:
+        best_summary = f"[{os.path.basename(run_dir)}] mods={selected_modalities} thr={metrics_at_best['threshold']:.4f} accuracy={metrics_at_best['accuracy']:.4f} f1={metrics_at_best['f1']:.4f} auroc={metrics.get('roc_auc', None)} auprc={metrics.get('auprc', None)}"
+        print(best_summary)
 
 
 def main():
@@ -394,6 +505,8 @@ def main():
     parser.add_argument('--batch_size', type=int, default=256)
     parser.add_argument('--data_path', type=str, default="/fd24T/zzhao3/EDA/preprocessed_data/60s_0.25s_sid", help='Optional override of data_path from log')
     parser.add_argument('--fold_number', type=int, default=None, help='Optional override of fold_number from log')
+    parser.add_argument('--include_eda', action='store_true', help='Include EDA encoder during evaluation if available')
+    parser.add_argument('--modalities', type=str, default='all', help='Comma-separated list {ecg,bvp,acc,temp,eda} or "all"; if omitted, infer from checkpoint/log')
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -403,7 +516,16 @@ def main():
 
     if has_top:
         try:
-            evaluate_run_dir(args.run_dir, device, args.batch_size, args.data_path, args.fold_number)
+            cli_modalities = parse_modalities_arg(args.modalities, args.include_eda)
+            evaluate_run_dir(
+                args.run_dir,
+                device,
+                args.batch_size,
+                args.data_path,
+                args.fold_number,
+                include_eda=args.include_eda,
+                modalities_override=cli_modalities,
+            )
         except Exception as e:
             print(f"Error evaluating {args.run_dir}: {e}")
 
@@ -416,7 +538,16 @@ def main():
 
     for sub in sorted(subdirs):
         try:
-            evaluate_run_dir(sub, device, args.batch_size, args.data_path, args.fold_number)
+            cli_modalities = parse_modalities_arg(args.modalities, args.include_eda)
+            evaluate_run_dir(
+                sub,
+                device,
+                args.batch_size,
+                args.data_path,
+                args.fold_number,
+                include_eda=args.include_eda,
+                modalities_override=cli_modalities,
+            )
         except Exception as e:
             print(f"Error evaluating {sub}: {e}")
 

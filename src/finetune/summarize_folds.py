@@ -36,7 +36,7 @@ def load_metrics(metrics_path: str) -> Dict[str, Any]:
 
 def aggregate_metrics(per_fold: List[Dict[str, Any]]) -> Dict[str, Dict[str, float]]:
     # Collect numeric metrics; ignore non-numeric or None
-    keys = ['accuracy', 'f1', 'precision', 'recall', 'roc_auc']
+    keys = ['accuracy', 'f1', 'precision', 'recall', 'roc_auc', 'auprc']
     summary: Dict[str, Dict[str, float]] = {}
     for k in keys:
         values = [float(m[k]) for m in per_fold if (k in m and m[k] is not None)]
@@ -93,7 +93,7 @@ def main():
         fold_id = parse_fold_id(fd)
         row = {'fold': fold_id}
         # Pull selected metrics if available
-        for key in ['accuracy', 'f1', 'precision', 'recall', 'roc_auc']:
+        for key in ['accuracy', 'f1', 'precision', 'recall', 'roc_auc', 'auprc']:
             row[key] = metrics.get(key, None)
         rows.append(row)
 

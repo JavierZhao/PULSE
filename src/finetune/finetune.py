@@ -9,7 +9,7 @@ import logging
 from tqdm import tqdm
 import pandas as pd
 import numpy as np
-from sklearn.metrics import f1_score, accuracy_score
+from sklearn.metrics import f1_score, accuracy_score, roc_auc_score, average_precision_score, precision_recall_curve
 
 # Add the project root to the Python path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
@@ -48,14 +48,17 @@ class StressClassifier(nn.Module):
                 nn.Linear(4, 1)  # 1 class (binary)
             )
 
-    def forward(self, ecg_sig, bvp_sig, acc_sig, temp_sig):
+    def forward(self, ecg_sig, bvp_sig, acc_sig, temp_sig, eda_sig=None):
         # Map input tensors by modality name
         input_map = {
             'ecg': ecg_sig,
             'bvp': bvp_sig,
             'acc': acc_sig,
             'temp': temp_sig,
+            'eda': eda_sig,
         }
+        if 'eda' in self.modalities and eda_sig is None:
+            raise ValueError("EDA modality selected but no eda signal provided to forward().")
         all_private_embs, all_shared_embs = {}, {}
         
         # 1. Get tokens from each selected MAE
@@ -147,26 +150,91 @@ def validate(model, dataloader, criterion, device):
     total_loss = 0
     all_preds = []
     all_labels = []
+    all_probs = []
 
     with torch.no_grad():
         pbar_val = tqdm(dataloader, desc="Validating")
         for batch in pbar_val:
-            ecg, bvp, acc, temp = [batch[k].to(device) for k in ('ecg', 'bvp', 'acc', 'temp')]
+            ecg = batch['ecg'].to(device)
+            bvp = batch['bvp'].to(device)
+            acc = batch['acc'].to(device)
+            temp = batch['temp'].to(device)
+            eda = batch['eda'].to(device) if 'eda' in model.modalities else None
             labels = batch['label'].to(device)
             
-            logits = model(ecg, bvp, acc, temp).squeeze()
+            logits = model(ecg, bvp, acc, temp, eda).squeeze()
             loss = criterion(logits, labels.float())
             total_loss += loss.item()
 
-            preds = (torch.sigmoid(logits) > 0.5).long()
+            probs = torch.sigmoid(logits)
+            preds = (probs > 0.5).long()
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
+            all_probs.extend(probs.detach().cpu().numpy())
 
     avg_loss = total_loss / len(dataloader)
     f1 = f1_score(all_labels, all_preds, average='binary')
     accuracy = accuracy_score(all_labels, all_preds)
-    
-    return avg_loss, f1, accuracy
+    try:
+        auroc = roc_auc_score(all_labels, all_probs)
+    except Exception:
+        auroc = float('nan')
+    try:
+        ap = average_precision_score(all_labels, all_probs)
+    except Exception:
+        ap = float('nan')
+
+    # Tune threshold on validation to maximize F1
+    tuned_thr = 0.5
+    f1_at_tuned = float('nan')
+    precision_at_tuned = float('nan')
+    recall_at_tuned = float('nan')
+    try:
+        labels_np = np.asarray(all_labels)
+        probs_np = np.asarray(all_probs)
+        # Guard degenerate cases: constant labels or scores
+        if len(np.unique(labels_np)) < 2 or len(np.unique(probs_np)) == 1:
+            preds_t = (probs_np >= tuned_thr).astype(int)
+            f1_at_tuned = float(f1_score(labels_np, preds_t, average='binary'))
+            from sklearn.metrics import precision_score, recall_score
+            precision_at_tuned = float(precision_score(labels_np, preds_t, zero_division=0))
+            recall_at_tuned = float(recall_score(labels_np, preds_t, zero_division=0))
+        else:
+            precision, recall, thresholds = precision_recall_curve(labels_np, probs_np)
+            if thresholds is not None and len(thresholds) > 0:
+                f1s = 2 * precision[:-1] * recall[:-1] / (precision[:-1] + recall[:-1] + 1e-8)
+                best_idx = int(np.nanargmax(f1s))
+                tuned_thr = float(thresholds[best_idx])
+                # Recompute F1/Precision/Recall at tuned threshold using predictions
+                preds_t = (probs_np >= tuned_thr).astype(int)
+                from sklearn.metrics import precision_score, recall_score
+                f1_at_tuned = float(f1_score(labels_np, preds_t, average='binary'))
+                precision_at_tuned = float(precision_score(labels_np, preds_t, zero_division=0))
+                recall_at_tuned = float(recall_score(labels_np, preds_t, zero_division=0))
+            else:
+                # Fallback sweep over actual operating points
+                candidates = np.unique(probs_np)
+                best_f1 = -1.0
+                best_t = 0.5
+                best_prec = 0.0
+                best_rec = 0.0
+                from sklearn.metrics import precision_score, recall_score
+                for t in candidates:
+                    preds_t = (probs_np >= t).astype(int)
+                    f1_t = f1_score(labels_np, preds_t, average='binary')
+                    if f1_t > best_f1:
+                        best_f1 = f1_t
+                        best_t = float(t)
+                        best_prec = float(precision_score(labels_np, preds_t, zero_division=0))
+                        best_rec = float(recall_score(labels_np, preds_t, zero_division=0))
+                tuned_thr = float(best_t)
+                f1_at_tuned = float(best_f1)
+                precision_at_tuned = best_prec
+                recall_at_tuned = best_rec
+    except Exception:
+        pass
+
+    return avg_loss, f1, accuracy, auroc, ap, tuned_thr, f1_at_tuned, precision_at_tuned, recall_at_tuned
 
 
 def train(args, pretrained_run_name=None):
@@ -175,7 +243,19 @@ def train(args, pretrained_run_name=None):
     os.makedirs(run_output_path, exist_ok=True)
 
     # Determine modalities list
-    modalities = ['ecg', 'bvp', 'acc', 'temp'] if args.modality == 'all' else [args.modality]
+    if getattr(args, 'modalities', 'all') == 'all':
+        modalities = ['ecg', 'bvp', 'acc', 'temp']
+        if getattr(args, 'include_eda', False):
+            modalities.append('eda')
+    else:
+        parsed = [m.strip().lower() for m in args.modalities.split(',') if m.strip()]
+        allowed = {'ecg', 'bvp', 'acc', 'temp', 'eda'}
+        invalid = [m for m in parsed if m not in allowed]
+        if len(invalid) > 0:
+            raise ValueError(f"Invalid modalities specified: {invalid}. Allowed: {sorted(list(allowed))}")
+        modalities = parsed
+        if getattr(args, 'include_eda', False) and 'eda' not in modalities:
+            modalities.append('eda')
     
     # --- Log arguments ---
     logging.info("--- Command Line Arguments ---")
@@ -262,7 +342,9 @@ def train(args, pretrained_run_name=None):
     
     criterion = nn.BCEWithLogitsLoss()
     
-    best_val_f1 = 0
+    best_val_ap = float('-inf')
+    best_val_acc = float('-inf')
+    best_val_f1_tuned = float('-inf')
     metrics_history = []
 
     for epoch in range(args.num_epochs):
@@ -276,11 +358,15 @@ def train(args, pretrained_run_name=None):
         pbar_train = tqdm(train_dataloader, desc=f"Training Epoch {epoch+1}")
         
         for batch in pbar_train:
-            ecg, bvp, acc, temp = [batch[k].to(device) for k in ('ecg', 'bvp', 'acc', 'temp')]
+            ecg = batch['ecg'].to(device)
+            bvp = batch['bvp'].to(device)
+            acc = batch['acc'].to(device)
+            temp = batch['temp'].to(device)
+            eda = batch['eda'].to(device) if 'eda' in model.modalities else None
             labels = batch['label'].to(device)
             
             optimizer.zero_grad()
-            logits = model(ecg, bvp, acc, temp).squeeze()
+            logits = model(ecg, bvp, acc, temp, eda).squeeze()
             loss = criterion(logits, labels.float())
             loss.backward()
             optimizer.step()
@@ -299,9 +385,9 @@ def train(args, pretrained_run_name=None):
         train_acc = accuracy_score(all_train_labels, all_train_preds)
         
         # --- Validation Loop ---
-        val_loss, val_f1, val_acc = validate(model, val_dataloader, criterion, device)
+        val_loss, val_f1, val_acc, val_auroc, val_ap, val_tuned_thr, val_f1_tuned, val_prec_tuned, val_rec_tuned = validate(model, val_dataloader, criterion, device)
         
-        logging.info(f"Epoch {epoch+1} | Train Loss: {avg_train_loss:.4f} | Train Acc: {train_acc:.4f} | Train F1: {train_f1:.4f} | Val Loss: {val_loss:.4f} | Val F1: {val_f1:.4f} | Val Acc: {val_acc:.4f}")
+        logging.info(f"Epoch {epoch+1} | Train Loss: {avg_train_loss:.4f} | Train Acc: {train_acc:.4f} | Train F1: {train_f1:.4f} | Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f} | Val F1: {val_f1:.4f} | Val AUROC: {val_auroc:.4f} | Val AUPRC: {val_ap:.4f} | Val F1@thr: {val_f1_tuned:.4f} (thr={val_tuned_thr:.3f}, P={val_prec_tuned:.3f}, R={val_rec_tuned:.3f})")
         
         metrics_history.append({
             'epoch': epoch + 1,
@@ -310,16 +396,44 @@ def train(args, pretrained_run_name=None):
             'train_f1': train_f1,
             'val_loss': val_loss,
             'val_acc': val_acc,
-            'val_f1': val_f1
+            'val_f1': val_f1,
+            'val_auroc': val_auroc,
+            'val_auprc': val_ap,
+            'val_f1_tuned': val_f1_tuned,
+            'val_tuned_thr': val_tuned_thr,
+            'val_precision_tuned': val_prec_tuned,
+            'val_recall_tuned': val_rec_tuned
         })
 
         scheduler.step()
         
-        if val_f1 > best_val_f1:
-            best_val_f1 = val_f1
+        # Selection based on chosen validation metric (default: AUPRC). Tie-break with F1@tuned.
+        selected_metric = getattr(args, 'val_selection_metric', 'auprc')
+        current_val_metric = val_ap if selected_metric == 'auprc' else val_acc
+        best_val_metric = best_val_ap if selected_metric == 'auprc' else best_val_acc
+
+        improved = False
+        if not np.isnan(current_val_metric):
+            if current_val_metric > best_val_metric + 1e-12:
+                improved = True
+            elif abs(current_val_metric - best_val_metric) <= 1e-12 and val_f1_tuned > best_val_f1_tuned:
+                improved = True
+        if improved:
+            if selected_metric == 'auprc':
+                best_val_ap = val_ap
+            else:
+                best_val_acc = val_acc
+            best_val_f1_tuned = val_f1_tuned
             best_model_path = os.path.join(run_output_path, "best_model.pt")
             torch.save(model.state_dict(), best_model_path)
-            logging.info(f"Saved new best model to {best_model_path} with F1 score: {val_f1:.4f}")
+            # Persist tuned threshold for LOSO testing
+            thr_path = os.path.join(run_output_path, "best_threshold.txt")
+            with open(thr_path, 'w') as f:
+                f.write(f"{val_tuned_thr:.6f}\n")
+            logging.info(
+                f"Saved new best model to {best_model_path} with {selected_metric.upper()}: {current_val_metric:.4f}, "
+                f"F1@thr: {val_f1_tuned:.4f} (thr={val_tuned_thr:.6f}). Threshold saved to {thr_path}"
+            )
 
     logging.info("Fine-tuning complete.")
     
@@ -359,7 +473,8 @@ def main():
     parser.add_argument('--linear_classifier', action='store_true', help='Use a linear classifier instead of a MLP')
     parser.add_argument('--only_shared', action='store_true', help='Use only the shared embeddings for classification')
     parser.add_argument('--fuse_embeddings', action='store_true', help='Fuse the embeddings of the private and shared modalities')
-    parser.add_argument('--modality', type=str, default='all', choices=['all', 'ecg', 'bvp', 'acc', 'temp'], help='Select a single modality or all')
+    parser.add_argument('--modalities', type=str, default='all', help='Comma-separated list of modalities from {ecg,bvp,acc,temp,eda}, or "all"')
+    parser.add_argument('--include_eda', action='store_true', help='Include EDA as an additional modality when using all modalities')
     # Model specific arguments (should match pre-training)
     parser.add_argument('--signal_length', type=int, default=3840, help='Length of the input signal windows.')
     parser.add_argument('--patch_window_len', type=int, default=96, help='Length of the patch window for the MAE.')
@@ -372,6 +487,7 @@ def main():
     parser.add_argument('--mlp_ratio', type=float, default=4.0, help='MLP ratio for the encoder.')
     parser.add_argument('--decoder_mlp_ratio', type=float, default=4.0, help='MLP ratio for the decoder.')
     parser.add_argument('--private_mask_ratio', type=float, default=0.5, help='Ratio of private to shared embeddings')
+    parser.add_argument('--val_selection_metric', type=str, default='auprc', choices=['accuracy', 'auprc'], help='Metric to select best model on validation set')
 
     args = parser.parse_args()
     

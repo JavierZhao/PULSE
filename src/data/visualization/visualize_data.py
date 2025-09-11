@@ -255,7 +255,7 @@ def main():
         description="Visualize preprocessed WESAD data from a specific fold, creating separate plots for each label and a class comparison plot."
     )
     parser.add_argument(
-        'fold_number', type=int,
+        'fold_number', type=int, default=2,
         help="The fold number to load and visualize (e.g., 2 for 'fold_2.npz')."
     )
     parser.add_argument(
