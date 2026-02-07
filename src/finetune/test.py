@@ -145,6 +145,8 @@ def build_model_from_args(
     fuse_override: Optional[bool] = None,
     linear_override: Optional[bool] = None,
     modalities: Optional[List[str]] = None,
+    num_classes: int = 1,
+    adaptive_fusion: bool = False,
 ) -> StressClassifier:
     """Construct StressClassifier with base CheapSensorMAE models using args from log and selected modalities."""
     model_args = {
@@ -174,6 +176,7 @@ def build_model_from_args(
     }
     only_shared = only_shared_override if only_shared_override is not None else _to_bool(args_dict.get('only_shared', False))
     fuse_embeddings = fuse_override if fuse_override is not None else _to_bool(args_dict.get('fuse_embeddings', False))
+    adaptive_fusion_flag = adaptive_fusion or _to_bool(args_dict.get('adaptive_fusion', False))
     linear_classifier = linear_override if linear_override is not None else _to_bool(args_dict.get('linear_classifier', False))
     model = StressClassifier(
         base_models,
@@ -183,15 +186,17 @@ def build_model_from_args(
         only_shared=only_shared,
         fuse_embeddings=fuse_embeddings,
         modalities=selected_modalities,
+        num_classes=num_classes,
+        adaptive_fusion=adaptive_fusion_flag,
     ).to(device)
     return model
 
 
-def evaluate(model: StressClassifier, dataloader: DataLoader, device: torch.device) -> Dict[str, Any]:
+def evaluate(model: StressClassifier, dataloader: DataLoader, device: torch.device, three_class: bool = False) -> Dict[str, Any]:
     model.eval()
     all_labels: list[int] = []
     all_preds: list[int] = []
-    all_scores: list[float] = []
+    all_scores: list[float] | list[list[float]] = []
 
     with torch.no_grad():
         for batch in dataloader:
@@ -201,9 +206,14 @@ def evaluate(model: StressClassifier, dataloader: DataLoader, device: torch.devi
             temp = batch['temp'].to(device)
             eda = batch['eda'].to(device) if 'eda' in model.modalities else None
             labels = batch['label'].to(device)
-            logits = model(ecg, bvp, acc, temp, eda).squeeze()
-            probs = torch.sigmoid(logits)
-            preds = (probs > 0.5).long()
+            logits = model(ecg, bvp, acc, temp, eda)
+            if three_class:
+                probs = torch.softmax(logits, dim=-1)
+                preds = torch.argmax(probs, dim=-1).long()
+            else:
+                logits = logits.squeeze()
+                probs = torch.sigmoid(logits)
+                preds = (probs > 0.5).long()
 
             all_labels.extend(labels.cpu().numpy().tolist())
             all_preds.extend(preds.cpu().numpy().tolist())
@@ -215,32 +225,64 @@ def evaluate(model: StressClassifier, dataloader: DataLoader, device: torch.devi
 
     metrics: Dict[str, Any] = {}
     metrics['accuracy'] = float(accuracy_score(y_true, y_pred))
-    metrics['f1'] = float(f1_score(y_true, y_pred, average='binary'))
-    metrics['precision'] = float(precision_score(y_true, y_pred, zero_division=0))
-    metrics['recall'] = float(recall_score(y_true, y_pred, zero_division=0))
+    metrics['f1'] = float(f1_score(y_true, y_pred, average=('macro' if three_class else 'binary')))
+    metrics['precision'] = float(precision_score(y_true, y_pred, average=('macro' if three_class else 'binary'), zero_division=0))
+    metrics['recall'] = float(recall_score(y_true, y_pred, average=('macro' if three_class else 'binary'), zero_division=0))
 
     try:
-        metrics['roc_auc'] = float(roc_auc_score(y_true, y_score))
+        if three_class:
+            y_score_arr = np.asarray(y_score)
+            metrics['roc_auc'] = float(roc_auc_score(y_true, y_score_arr, multi_class='ovr', average='macro'))
+        else:
+            metrics['roc_auc'] = float(roc_auc_score(y_true, y_score))
     except Exception:
         metrics['roc_auc'] = None
 
     try:
-        metrics['auprc'] = float(average_precision_score(y_true, y_score))
+        if three_class:
+            metrics['auprc'] = None
+        else:
+            metrics['auprc'] = float(average_precision_score(y_true, y_score))
     except Exception:
         metrics['auprc'] = None
 
-    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+    # One-vs-rest per-class AUROC and AUPRC for 3-class setting
+    if three_class:
+        try:
+            y_score_arr = np.asarray(y_score)
+            ovr_auroc: Dict[int, Any] = {}
+            ovr_auprc: Dict[int, Any] = {}
+            for c in range(y_score_arr.shape[1]):
+                y_true_bin = (y_true == c).astype(int)
+                try:
+                    ovr_auroc[c] = float(roc_auc_score(y_true_bin, y_score_arr[:, c]))
+                except Exception:
+                    ovr_auroc[c] = None
+                try:
+                    ovr_auprc[c] = float(average_precision_score(y_true_bin, y_score_arr[:, c]))
+                except Exception:
+                    ovr_auprc[c] = None
+            metrics['ovr_auroc'] = ovr_auroc
+            metrics['ovr_auprc'] = ovr_auprc
+            # Macro AUPRC as mean of per-class AUPRCs (excluding None/NaN)
+            vals = [v for v in ovr_auprc.values() if v is not None and not np.isnan(v)]
+            metrics['auprc'] = float(np.mean(vals)) if len(vals) > 0 else None
+        except Exception:
+            pass
+
+    labels_order = [0, 1, 2] if three_class else [0, 1]
+    cm = confusion_matrix(y_true, y_pred, labels=labels_order)
     metrics['confusion_matrix'] = cm.tolist()
     metrics['classification_report'] = classification_report(y_true, y_pred, digits=4)
 
     return metrics, y_true, y_score, y_pred, cm
 
 
-def plot_confusion_matrix(cm: np.ndarray, save_path: str):
+def plot_confusion_matrix(cm: np.ndarray, save_path: str, three_class: bool = False):
     fig, ax = plt.subplots(figsize=(5, 5))
     im = ax.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
     ax.figure.colorbar(im, ax=ax)
-    classes = ['Non-stress', 'Stress']
+    classes = ['Baseline', 'Stress', 'Amusement'] if three_class else ['Non-stress', 'Stress']
     tick_marks = np.arange(len(classes))
     ax.set(xticks=tick_marks, yticks=tick_marks, xticklabels=classes, yticklabels=classes, ylabel='True label', xlabel='Predicted label', title='Confusion Matrix')
 
@@ -254,7 +296,9 @@ def plot_confusion_matrix(cm: np.ndarray, save_path: str):
     plt.close(fig)
 
 
-def plot_roc_pr_curves(y_true: np.ndarray, y_score: np.ndarray, save_dir: str):
+def plot_roc_pr_curves(y_true: np.ndarray, y_score: np.ndarray, save_dir: str, three_class: bool = False):
+    if three_class:
+        return
     try:
         fpr, tpr, _ = roc_curve(y_true, y_score)
         roc_auc = auc(fpr, tpr)
@@ -357,7 +401,12 @@ def evaluate_run_dir(
     state_keys = list(state.keys())
     is_mlp = any(k.startswith('classifier.3.') for k in state_keys)
     first_w = state.get('classifier.0.weight', None)
+    last_w = state.get('classifier.3.weight', None) if is_mlp else state.get('classifier.0.weight', None)
     embed_dim = int(logged_args.get('embed_dim', 1024))
+    num_classes = int(last_w.shape[0]) if last_w is not None and len(last_w.shape) == 2 else 1
+    three_class = (num_classes == 3)
+    # Detect adaptive fusion params in checkpoint
+    has_adaptive = any(k.startswith('fusion_logits_') for k in state_keys)
 
     # Determine modalities to evaluate
     # Priority: CLI --modalities (finetune-compatible, passed in) -> checkpoint inferred -> log fallback
@@ -404,6 +453,8 @@ def evaluate_run_dir(
         fuse_override=fuse_override,
         linear_override=linear_override,
         modalities=selected_modalities,
+        num_classes=num_classes,
+        adaptive_fusion=has_adaptive,
     )
 
     try:
@@ -414,23 +465,24 @@ def evaluate_run_dir(
     model.eval()
 
     # DataLoader for test set
-    test_dataset = WESADDataset(data_path=dp, fold_number=fn, split='test')
+    test_dataset = WESADDataset(data_path=dp, fold_number=fn, split='test', three_class=three_class)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
 
     # Evaluate (base metrics computed at threshold 0.5)
-    metrics, y_true, y_score, y_pred, cm = evaluate(model, test_loader, device_t)
+    metrics, y_true, y_score, y_pred, cm = evaluate(model, test_loader, device_t, three_class=three_class)
 
     # Load best validation threshold if available
     best_thr: Optional[float] = None
-    best_thr_path = os.path.join(run_dir, 'best_threshold.txt')
-    if os.path.isfile(best_thr_path):
-        try:
-            with open(best_thr_path, 'r') as f:
-                first_line = f.readline().strip()
-                if first_line:
-                    best_thr = float(first_line)
-        except Exception:
-            best_thr = None
+    if not three_class:
+        best_thr_path = os.path.join(run_dir, 'best_threshold.txt')
+        if os.path.isfile(best_thr_path):
+            try:
+                with open(best_thr_path, 'r') as f:
+                    first_line = f.readline().strip()
+                    if first_line:
+                        best_thr = float(first_line)
+            except Exception:
+                best_thr = None
 
     # Helper to compute threshold-dependent stats
     def threshold_metrics(threshold: float) -> Dict[str, Any]:
@@ -456,7 +508,7 @@ def evaluate_run_dir(
         'confusion_matrix': metrics['confusion_matrix'],
         'classification_report': metrics['classification_report'],
     }
-    metrics_at_best = threshold_metrics(best_thr) if best_thr is not None else None
+    metrics_at_best = threshold_metrics(best_thr) if (best_thr is not None and not three_class) else None
 
     # Augment metrics dict with threshold-independent and per-threshold sections
     metrics_out = dict(metrics)
@@ -473,21 +525,23 @@ def evaluate_run_dir(
     # Write classification reports
     with open(os.path.join(run_dir, 'test_classification_report.txt'), 'w') as f:
         f.write(metrics_at_0_5['classification_report'])
-    with open(os.path.join(run_dir, 'test_classification_report_thr_0.5.txt'), 'w') as f:
-        f.write(metrics_at_0_5['classification_report'])
-    if metrics_at_best is not None:
-        with open(os.path.join(run_dir, 'test_classification_report_thr_best.txt'), 'w') as f:
-            f.write(metrics_at_best['classification_report'])
+    if not three_class:
+        with open(os.path.join(run_dir, 'test_classification_report_thr_0.5.txt'), 'w') as f:
+            f.write(metrics_at_0_5['classification_report'])
+        if metrics_at_best is not None:
+            with open(os.path.join(run_dir, 'test_classification_report_thr_best.txt'), 'w') as f:
+                f.write(metrics_at_best['classification_report'])
 
     # Confusion matrices (keep legacy filename for 0.5)
     cm_path = os.path.join(run_dir, 'test_confusion_matrix.png')
-    plot_confusion_matrix(np.array(metrics_at_0_5['confusion_matrix']), cm_path)
-    plot_confusion_matrix(np.array(metrics_at_0_5['confusion_matrix']), os.path.join(run_dir, 'test_confusion_matrix_thr_0.5.png'))
-    if metrics_at_best is not None:
-        plot_confusion_matrix(np.array(metrics_at_best['confusion_matrix']), os.path.join(run_dir, 'test_confusion_matrix_thr_best.png'))
+    plot_confusion_matrix(np.array(metrics_at_0_5['confusion_matrix']), cm_path, three_class=three_class)
+    if not three_class:
+        plot_confusion_matrix(np.array(metrics_at_0_5['confusion_matrix']), os.path.join(run_dir, 'test_confusion_matrix_thr_0.5.png'))
+        if metrics_at_best is not None:
+            plot_confusion_matrix(np.array(metrics_at_best['confusion_matrix']), os.path.join(run_dir, 'test_confusion_matrix_thr_best.png'))
 
     # ROC and PR curves
-    plot_roc_pr_curves(y_true, y_score, run_dir)
+    plot_roc_pr_curves(y_true, y_score, run_dir, three_class=three_class)
 
     # Console summary
     base_summary = f"[{os.path.basename(run_dir)}] mods={selected_modalities} thr=0.5 accuracy={metrics_at_0_5['accuracy']:.4f} f1={metrics_at_0_5['f1']:.4f} auroc={metrics.get('roc_auc', None)} auprc={metrics.get('auprc', None)}"

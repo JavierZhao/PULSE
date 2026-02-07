@@ -18,10 +18,12 @@ from src.model.CheapSensorMAE import CheapSensorMAE
 from src.data.wesad_dataset import WESADDataset
 
 class StressClassifier(nn.Module):
-    def __init__(self, models, embed_dim, freeze_backbone=False, linear_classifier=False, only_shared=False, fuse_embeddings=False, modalities=None):
+    def __init__(self, models, embed_dim, freeze_backbone=False, linear_classifier=False, only_shared=False, fuse_embeddings=False, modalities=None, num_classes=1, adaptive_fusion=False):
         super().__init__()
         self.models = nn.ModuleDict(models)
         self.modalities = modalities if modalities is not None else ['ecg', 'bvp', 'acc', 'temp']
+        self.num_classes = num_classes
+        self.adaptive_fusion = adaptive_fusion
         if freeze_backbone:
             for param in self.models.parameters():
                 param.requires_grad = False
@@ -38,14 +40,21 @@ class StressClassifier(nn.Module):
         self.fusion_dim = fusion_dim
         self.only_shared = only_shared
         self.fuse_embeddings = fuse_embeddings
+        # Optional learnable fusion weights when averaging embeddings
+        if self.adaptive_fusion and self.fuse_embeddings:
+            if self.only_shared:
+                self.fusion_logits_shared = nn.Parameter(torch.zeros(num_modalities))
+            else:
+                self.fusion_logits_shared = nn.Parameter(torch.zeros(num_modalities))
+                self.fusion_logits_private = nn.Parameter(torch.zeros(num_modalities))
         if linear_classifier:
-            self.classifier = nn.Sequential(nn.Linear(self.fusion_dim, 1))
+            self.classifier = nn.Sequential(nn.Linear(self.fusion_dim, self.num_classes))
         else:
             self.classifier = nn.Sequential( 
                 nn.Linear(self.fusion_dim, 4),
                 nn.GELU(),
                 nn.Dropout(0.2),
-                nn.Linear(4, 1)  # 1 class (binary)
+                nn.Linear(4, self.num_classes)
             )
 
     def forward(self, ecg_sig, bvp_sig, acc_sig, temp_sig, eda_sig=None):
@@ -84,16 +93,29 @@ class StressClassifier(nn.Module):
         # 3. Fusion 
         if self.fuse_embeddings and self.only_shared:
             # first stack the shared embeddings for selected modalities, then take the mean
-            fusion_vector = torch.stack(
-                [sh_pool[name] for name in self.modalities], dim=1
-            ).mean(dim=1)
+            if self.adaptive_fusion:
+                stacked = torch.stack([sh_pool[name] for name in self.modalities], dim=1)
+                weights = torch.softmax(self.fusion_logits_shared, dim=0).reshape(1, -1, 1)
+                fusion_vector = (stacked * weights).sum(dim=1)
+            else:
+                fusion_vector = torch.stack(
+                    [sh_pool[name] for name in self.modalities], dim=1
+                ).mean(dim=1)
         elif self.fuse_embeddings and not self.only_shared:
-            fusion_shared = torch.stack(
-                [sh_pool[name] for name in self.modalities], dim=1
-            ).mean(dim=1)
-            fusion_private = torch.stack(
-                [priv_pool[name] for name in self.modalities], dim=1
-            ).mean(dim=1)
+            if self.adaptive_fusion:
+                stacked_sh = torch.stack([sh_pool[name] for name in self.modalities], dim=1)
+                w_sh = torch.softmax(self.fusion_logits_shared, dim=0).reshape(1, -1, 1)
+                fusion_shared = (stacked_sh * w_sh).sum(dim=1)
+                stacked_pr = torch.stack([priv_pool[name] for name in self.modalities], dim=1)
+                w_pr = torch.softmax(self.fusion_logits_private, dim=0).reshape(1, -1, 1)
+                fusion_private = (stacked_pr * w_pr).sum(dim=1)
+            else:
+                fusion_shared = torch.stack(
+                    [sh_pool[name] for name in self.modalities], dim=1
+                ).mean(dim=1)
+                fusion_private = torch.stack(
+                    [priv_pool[name] for name in self.modalities], dim=1
+                ).mean(dim=1)
             fusion_vector = torch.cat([fusion_shared, fusion_private], dim=-1)
         elif not self.fuse_embeddings and self.only_shared:
             fusion_vector = torch.cat([sh_pool[name] for name in self.modalities], dim=-1)
@@ -126,10 +148,11 @@ def setup_logging(run_name, output_path):
     console_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
     logger.addHandler(console_handler)
 
+
 def load_pretrained_models(path, device, model_args, modalities=None):
     """Loads the pretrained MAE models from a checkpoint file."""
-    if not os.path.isfile(path):
-        raise FileNotFoundError(f"Checkpoint file not found at {path}")
+    # if not os.path.isfile(path):
+    #     raise FileNotFoundError(f"Checkpoint file not found at {path}")
         
     checkpoint = torch.load(path, map_location=device)
     
@@ -137,14 +160,14 @@ def load_pretrained_models(path, device, model_args, modalities=None):
     models = {}
     for name in selected:
         model = CheapSensorMAE(modality_name=name, **model_args).to(device)
-        model_state_dict = checkpoint[f'{name}_model_state_dict']
+        model_state_dict = checkpoint[f'{name}_model_state_dict'] if name != 'eda' else checkpoint[f'model_state_dict']
         model.load_state_dict(model_state_dict)
         models[name] = model
         
     logging.info(f"Loaded pretrained models from {path} for modalities={selected}")
     return models
 
-def validate(model, dataloader, criterion, device):
+def validate(model, dataloader, criterion, device, three_class=False):
     """Runs a validation loop and returns metrics."""
     model.eval()
     total_loss = 0
@@ -162,84 +185,120 @@ def validate(model, dataloader, criterion, device):
             eda = batch['eda'].to(device) if 'eda' in model.modalities else None
             labels = batch['label'].to(device)
             
-            logits = model(ecg, bvp, acc, temp, eda).squeeze()
-            loss = criterion(logits, labels.float())
+            logits = model(ecg, bvp, acc, temp, eda)
+            if three_class:
+                loss = criterion(logits, labels.long())
+            else:
+                logits = logits.squeeze()
+                loss = criterion(logits, labels.float())
             total_loss += loss.item()
 
-            probs = torch.sigmoid(logits)
-            preds = (probs > 0.5).long()
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
-            all_probs.extend(probs.detach().cpu().numpy())
+            if three_class:
+                probs = torch.softmax(logits, dim=-1)
+                preds = torch.argmax(probs, dim=-1).long()
+                all_preds.extend(preds.cpu().numpy())
+                all_labels.extend(labels.cpu().numpy())
+                all_probs.extend(probs.detach().cpu().numpy())
+            else:
+                probs = torch.sigmoid(logits)
+                preds = (probs > 0.5).long()
+                all_preds.extend(preds.cpu().numpy())
+                all_labels.extend(labels.cpu().numpy())
+                all_probs.extend(probs.detach().cpu().numpy())
 
     avg_loss = total_loss / len(dataloader)
-    f1 = f1_score(all_labels, all_preds, average='binary')
-    accuracy = accuracy_score(all_labels, all_preds)
-    try:
-        auroc = roc_auc_score(all_labels, all_probs)
-    except Exception:
-        auroc = float('nan')
-    try:
-        ap = average_precision_score(all_labels, all_probs)
-    except Exception:
-        ap = float('nan')
+    if three_class:
+        f1 = f1_score(all_labels, all_preds, average='macro')
+        accuracy = accuracy_score(all_labels, all_preds)
+        try:
+            y_score_arr = np.asarray(all_probs)
+            auroc = roc_auc_score(all_labels, y_score_arr, multi_class='ovr', average='macro')
+        except Exception:
+            auroc = float('nan')
+        # Macro one-vs-rest AUPRC across classes
+        try:
+            labels_np = np.asarray(all_labels)
+            y_score_arr = np.asarray(all_probs)
+            num_classes = y_score_arr.shape[1] if y_score_arr.ndim == 2 else 0
+            aps = []
+            for c in range(num_classes):
+                y_true_bin = (labels_np == c).astype(int)
+                try:
+                    aps.append(average_precision_score(y_true_bin, y_score_arr[:, c]))
+                except Exception:
+                    aps.append(np.nan)
+            ap = float(np.nanmean(aps)) if len(aps) > 0 else float('nan')
+        except Exception:
+            ap = float('nan')
+    else:
+        f1 = f1_score(all_labels, all_preds, average='binary')
+        accuracy = accuracy_score(all_labels, all_preds)
+        try:
+            auroc = roc_auc_score(all_labels, all_probs)
+        except Exception:
+            auroc = float('nan')
+        try:
+            ap = average_precision_score(all_labels, all_probs)
+        except Exception:
+            ap = float('nan')
 
     # Tune threshold on validation to maximize F1
     tuned_thr = 0.5
     f1_at_tuned = float('nan')
     precision_at_tuned = float('nan')
     recall_at_tuned = float('nan')
-    try:
-        labels_np = np.asarray(all_labels)
-        probs_np = np.asarray(all_probs)
-        # Guard degenerate cases: constant labels or scores
-        if len(np.unique(labels_np)) < 2 or len(np.unique(probs_np)) == 1:
-            preds_t = (probs_np >= tuned_thr).astype(int)
-            f1_at_tuned = float(f1_score(labels_np, preds_t, average='binary'))
-            from sklearn.metrics import precision_score, recall_score
-            precision_at_tuned = float(precision_score(labels_np, preds_t, zero_division=0))
-            recall_at_tuned = float(recall_score(labels_np, preds_t, zero_division=0))
-        else:
-            precision, recall, thresholds = precision_recall_curve(labels_np, probs_np)
-            if thresholds is not None and len(thresholds) > 0:
-                f1s = 2 * precision[:-1] * recall[:-1] / (precision[:-1] + recall[:-1] + 1e-8)
-                best_idx = int(np.nanargmax(f1s))
-                tuned_thr = float(thresholds[best_idx])
-                # Recompute F1/Precision/Recall at tuned threshold using predictions
+    if not three_class:
+        try:
+            labels_np = np.asarray(all_labels)
+            probs_np = np.asarray(all_probs)
+            # Guard degenerate cases: constant labels or scores
+            if len(np.unique(labels_np)) < 2 or len(np.unique(probs_np)) == 1:
                 preds_t = (probs_np >= tuned_thr).astype(int)
-                from sklearn.metrics import precision_score, recall_score
                 f1_at_tuned = float(f1_score(labels_np, preds_t, average='binary'))
+                from sklearn.metrics import precision_score, recall_score
                 precision_at_tuned = float(precision_score(labels_np, preds_t, zero_division=0))
                 recall_at_tuned = float(recall_score(labels_np, preds_t, zero_division=0))
             else:
-                # Fallback sweep over actual operating points
-                candidates = np.unique(probs_np)
-                best_f1 = -1.0
-                best_t = 0.5
-                best_prec = 0.0
-                best_rec = 0.0
-                from sklearn.metrics import precision_score, recall_score
-                for t in candidates:
-                    preds_t = (probs_np >= t).astype(int)
-                    f1_t = f1_score(labels_np, preds_t, average='binary')
-                    if f1_t > best_f1:
-                        best_f1 = f1_t
-                        best_t = float(t)
-                        best_prec = float(precision_score(labels_np, preds_t, zero_division=0))
-                        best_rec = float(recall_score(labels_np, preds_t, zero_division=0))
-                tuned_thr = float(best_t)
-                f1_at_tuned = float(best_f1)
-                precision_at_tuned = best_prec
-                recall_at_tuned = best_rec
-    except Exception:
-        pass
+                precision, recall, thresholds = precision_recall_curve(labels_np, probs_np)
+                if thresholds is not None and len(thresholds) > 0:
+                    f1s = 2 * precision[:-1] * recall[:-1] / (precision[:-1] + recall[:-1] + 1e-8)
+                    best_idx = int(np.nanargmax(f1s))
+                    tuned_thr = float(thresholds[best_idx])
+                    # Recompute F1/Precision/Recall at tuned threshold using predictions
+                    preds_t = (probs_np >= tuned_thr).astype(int)
+                    from sklearn.metrics import precision_score, recall_score
+                    f1_at_tuned = float(f1_score(labels_np, preds_t, average='binary'))
+                    precision_at_tuned = float(precision_score(labels_np, preds_t, zero_division=0))
+                    recall_at_tuned = float(recall_score(labels_np, preds_t, zero_division=0))
+                else:
+                    # Fallback sweep over actual operating points
+                    candidates = np.unique(probs_np)
+                    best_f1 = -1.0
+                    best_t = 0.5
+                    best_prec = 0.0
+                    best_rec = 0.0
+                    from sklearn.metrics import precision_score, recall_score
+                    for t in candidates:
+                        preds_t = (probs_np >= t).astype(int)
+                        f1_t = f1_score(labels_np, preds_t, average='binary')
+                        if f1_t > best_f1:
+                            best_f1 = f1_t
+                            best_t = float(t)
+                            best_prec = float(precision_score(labels_np, preds_t, zero_division=0))
+                            best_rec = float(recall_score(labels_np, preds_t, zero_division=0))
+                    tuned_thr = float(best_t)
+                    f1_at_tuned = float(best_f1)
+                    precision_at_tuned = best_prec
+                    recall_at_tuned = best_rec
+        except Exception:
+            pass
 
     return avg_loss, f1, accuracy, auroc, ap, tuned_thr, f1_at_tuned, precision_at_tuned, recall_at_tuned
 
 
 def train(args, pretrained_run_name=None):
     device = torch.device(args.device)
-    run_output_path = os.path.join(args.output_path, args.run_name)
+    run_output_path = os.path.join(args.output_path, f"{args.save_name}/f_{args.fold_number}")
     os.makedirs(run_output_path, exist_ok=True)
 
     # Determine modalities list
@@ -282,9 +341,26 @@ def train(args, pretrained_run_name=None):
         }
     else:
         logging.info("--- Loading Pretrained Models for Fine-tuning ---")
-        load_run_name = pretrained_run_name if pretrained_run_name else args.run_name
-        args.pretrained_ckpt_path = f"/fd24T/zzhao3/EDA/results/cheap_maes/{load_run_name}/models/best_ckpt.pt"
-        base_models = load_pretrained_models(args.pretrained_ckpt_path, device, model_args, modalities)
+        # Interpret run_name as either a bare name (legacy) or an absolute/relative path to a models directory
+        # If it points to a directory, look for best_ckpt.pt inside; if it points to a file, use it directly
+        candidate = pretrained_run_name if pretrained_run_name else args.run_name
+        print("path candidate", candidate)
+        ckpt_path = candidate
+        if os.path.isfile(candidate):
+            ckpt_path = candidate
+        elif os.path.isdir(candidate):
+            file_candidate = os.path.join(candidate, 'best_ckpt.pt')
+            if os.path.isfile(file_candidate):
+                ckpt_path = file_candidate
+        else:
+            # Legacy behavior: assume a run name under results/cheap_maes/<name>/models/best_ckpt.pt
+            legacy = os.path.join('/fd24T/zzhao3/EDA/results/cheap_maes', candidate, 'models', 'best_ckpt.pt')
+            if os.path.isfile(legacy):
+                ckpt_path = legacy
+        if ckpt_path is None:
+            raise FileNotFoundError(f"Could not resolve pretrained checkpoint from run_name='{args.run_name}'. Provide a full path to a file or models dir, or ensure legacy path exists.")
+        args.pretrained_ckpt_path = ckpt_path
+        base_models = load_pretrained_models(ckpt_path, device, model_args, modalities)
 
     # --- Create Classifier ---
     model = StressClassifier(
@@ -295,22 +371,24 @@ def train(args, pretrained_run_name=None):
         args.only_shared,
         args.fuse_embeddings,
         modalities=modalities,
+        num_classes=(3 if getattr(args, 'three_class', False) else 1),
+        adaptive_fusion=getattr(args, 'adaptive_fusion', False),
     ).to(device)
     
     # --- Optimizer ---
     if args.freeze_backbone:
-        optimizer = torch.optim.Adam(model.classifier.parameters(), lr=args.head_lr)
+        optimizer = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=args.head_lr)
     else:
         optimizer = torch.optim.Adam([
             {'params': model.models.parameters(), 'lr': args.backbone_lr},
-            {'params': model.classifier.parameters(), 'lr': args.head_lr}
+            {'params': [p for n, p in model.named_parameters() if n.startswith('classifier') or n.startswith('fusion_logits')], 'lr': args.head_lr}
         ])
     
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=args.lr_restart_epochs, T_mult=args.t_mult)
 
     # --- Data ---
     # Load the full training dataset for the fold
-    full_train_dataset = WESADDataset(data_path=args.data_path, fold_number=args.fold_number, split='train')
+    full_train_dataset = WESADDataset(data_path=args.data_path, fold_number=args.fold_number, split='train', three_class=getattr(args, 'three_class', False))
 
     # Ensure the validation subject is not the same as the test subject
     if args.val_subject_id == args.fold_number:
@@ -340,7 +418,7 @@ def train(args, pretrained_run_name=None):
     train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
     val_dataloader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
     
-    criterion = nn.BCEWithLogitsLoss()
+    criterion = nn.CrossEntropyLoss() if getattr(args, 'three_class', False) else nn.BCEWithLogitsLoss()
     
     best_val_ap = float('-inf')
     best_val_acc = float('-inf')
@@ -366,14 +444,21 @@ def train(args, pretrained_run_name=None):
             labels = batch['label'].to(device)
             
             optimizer.zero_grad()
-            logits = model(ecg, bvp, acc, temp, eda).squeeze()
-            loss = criterion(logits, labels.float())
+            logits = model(ecg, bvp, acc, temp, eda)
+            if getattr(args, 'three_class', False):
+                loss = criterion(logits, labels.long())
+            else:
+                logits = logits.squeeze()
+                loss = criterion(logits, labels.float())
             loss.backward()
             optimizer.step()
             
             train_loss += loss.item()
             
-            preds = (torch.sigmoid(logits) > 0.5).long()
+            if getattr(args, 'three_class', False):
+                preds = torch.argmax(torch.softmax(logits, dim=-1), dim=-1).long()
+            else:
+                preds = (torch.sigmoid(logits) > 0.5).long()
             all_train_preds.extend(preds.cpu().numpy())
             all_train_labels.extend(labels.cpu().numpy())
             
@@ -381,11 +466,11 @@ def train(args, pretrained_run_name=None):
             pbar_train.set_postfix(Train_Acc=batch_acc, Train_Loss=loss.item())
 
         avg_train_loss = train_loss / len(train_dataloader)
-        train_f1 = f1_score(all_train_labels, all_train_preds, average='binary')
+        train_f1 = f1_score(all_train_labels, all_train_preds, average=('macro' if getattr(args, 'three_class', False) else 'binary'))
         train_acc = accuracy_score(all_train_labels, all_train_preds)
         
         # --- Validation Loop ---
-        val_loss, val_f1, val_acc, val_auroc, val_ap, val_tuned_thr, val_f1_tuned, val_prec_tuned, val_rec_tuned = validate(model, val_dataloader, criterion, device)
+        val_loss, val_f1, val_acc, val_auroc, val_ap, val_tuned_thr, val_f1_tuned, val_prec_tuned, val_rec_tuned = validate(model, val_dataloader, criterion, device, three_class=getattr(args, 'three_class', False))
         
         logging.info(f"Epoch {epoch+1} | Train Loss: {avg_train_loss:.4f} | Train Acc: {train_acc:.4f} | Train F1: {train_f1:.4f} | Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f} | Val F1: {val_f1:.4f} | Val AUROC: {val_auroc:.4f} | Val AUPRC: {val_ap:.4f} | Val F1@thr: {val_f1_tuned:.4f} (thr={val_tuned_thr:.3f}, P={val_prec_tuned:.3f}, R={val_rec_tuned:.3f})")
         
@@ -426,14 +511,19 @@ def train(args, pretrained_run_name=None):
             best_val_f1_tuned = val_f1_tuned
             best_model_path = os.path.join(run_output_path, "best_model.pt")
             torch.save(model.state_dict(), best_model_path)
-            # Persist tuned threshold for LOSO testing
-            thr_path = os.path.join(run_output_path, "best_threshold.txt")
-            with open(thr_path, 'w') as f:
-                f.write(f"{val_tuned_thr:.6f}\n")
-            logging.info(
-                f"Saved new best model to {best_model_path} with {selected_metric.upper()}: {current_val_metric:.4f}, "
-                f"F1@thr: {val_f1_tuned:.4f} (thr={val_tuned_thr:.6f}). Threshold saved to {thr_path}"
-            )
+            if not getattr(args, 'three_class', False):
+                # Persist tuned threshold for LOSO testing
+                thr_path = os.path.join(run_output_path, "best_threshold.txt")
+                with open(thr_path, 'w') as f:
+                    f.write(f"{val_tuned_thr:.6f}\n")
+                logging.info(
+                    f"Saved new best model to {best_model_path} with {selected_metric.upper()}: {current_val_metric:.4f}, "
+                    f"F1@thr: {val_f1_tuned:.4f} (thr={val_tuned_thr:.6f}). Threshold saved to {thr_path}"
+                )
+            else:
+                logging.info(
+                    f"Saved new best model to {best_model_path} with {selected_metric.upper()}: {current_val_metric:.4f}"
+                )
 
     logging.info("Fine-tuning complete.")
     
@@ -453,6 +543,7 @@ def main():
     parser = argparse.ArgumentParser(description='Finetune Cheap Sensor MAEs for Stress Prediction')
     # Paths
     parser.add_argument('--run_name', type=str, default=datetime.now().strftime("%Y%m%d_%H%M%S_finetune"))
+    parser.add_argument('--save_name', type=str, default=datetime.now().strftime("%Y%m%d_%H%M%S_finetune"))
     parser.add_argument('--tag', type=str, default="", help='Optional tag to append to the run name.')
     parser.add_argument('--data_path', type=str, default="/fd24T/zzhao3/EDA/preprocessed_data/60s_0.25s_sid", help='Path to the WESAD preprocessed data directory')
     parser.add_argument('--output_path', type=str, default="/fd24T/zzhao3/EDA/results/finetuned_models", help='Directory to save logs and models')    
@@ -473,7 +564,7 @@ def main():
     parser.add_argument('--linear_classifier', action='store_true', help='Use a linear classifier instead of a MLP')
     parser.add_argument('--only_shared', action='store_true', help='Use only the shared embeddings for classification')
     parser.add_argument('--fuse_embeddings', action='store_true', help='Fuse the embeddings of the private and shared modalities')
-    parser.add_argument('--modalities', type=str, default='all', help='Comma-separated list of modalities from {ecg,bvp,acc,temp,eda}, or "all"')
+    parser.add_argument('--modalities', type=str, default='all', help='Comma-separated list of modalities from {ecg,bvp,acc,temp}, or "all"')
     parser.add_argument('--include_eda', action='store_true', help='Include EDA as an additional modality when using all modalities')
     # Model specific arguments (should match pre-training)
     parser.add_argument('--signal_length', type=int, default=3840, help='Length of the input signal windows.')
@@ -488,15 +579,17 @@ def main():
     parser.add_argument('--decoder_mlp_ratio', type=float, default=4.0, help='MLP ratio for the decoder.')
     parser.add_argument('--private_mask_ratio', type=float, default=0.5, help='Ratio of private to shared embeddings')
     parser.add_argument('--val_selection_metric', type=str, default='auprc', choices=['accuracy', 'auprc'], help='Metric to select best model on validation set')
+    parser.add_argument('--three_class', action='store_true', help='Use three-class classification (baseline, stress, amusement)')
+    parser.add_argument('--adaptive_fusion', action='store_true', help='Use learnable per-modality fusion weights when fusing embeddings')
 
     args = parser.parse_args()
     
     # Store original run name for loading pretrained model and append tag if provided
     original_run_name = args.run_name
-    if args.tag:
-        args.run_name = f"{args.run_name}_{args.tag}"
+    # if args.tag:
+    #     args.run_name = f"{args.run_name}_{args.tag}"
 
-    setup_logging(args.run_name, args.output_path)
+    setup_logging(f"{args.save_name}/f_{args.fold_number}", args.output_path)
     
     # Set random seed for reproducibility
     np.random.seed(args.seed)

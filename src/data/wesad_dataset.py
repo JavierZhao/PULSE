@@ -7,7 +7,7 @@ import logging
 
 class WESADDataset(Dataset):
     """Loads all required modalities, labels, and subject IDs from a preprocessed WESAD .npz fold."""
-    def __init__(self, data_path, fold_number, split='train'):
+    def __init__(self, data_path, fold_number, split='train', three_class=False):
         super().__init__()
         file_path = os.path.join(data_path, f"fold_{fold_number}.npz")
         logging.info(f"Loading {split} data from: {file_path}")
@@ -36,9 +36,12 @@ class WESADDataset(Dataset):
         self.acc_idx = np.where(self.feature_names == 'net_acc_wrist')[0][0]
         self.temp_idx = np.where(self.feature_names == 'temp')[0][0]
 
-        # Convert WESAD labels to binary (stress vs. non-stress)
-        # WESAD labels: 1=baseline, 2=stress, 3=amusement. Map stress to 1, others to 0.
-        self.labels = (self.L == 2).astype(int)
+        # Convert WESAD labels to binary (stress vs. non-stress) or three-class
+        # WESAD labels: 1=baseline, 2=stress, 3=amusement.
+        if three_class:
+            self.labels = (self.L.astype(int) - 1)
+        else:
+            self.labels = (self.L == 2).astype(int)
 
         logging.info(f"Loaded {self.X.shape[0]} windows for {split} split from fold {fold_number}.")
 
