@@ -9,8 +9,8 @@ import argparse
 
 # --- Configuration ---
 TARGET_FS = 64  # Hz
-WINDOW_SECONDS = 10
-STRIDE_SECONDS = 10
+WINDOW_SECONDS = 60
+STRIDE_SECONDS = 0.25
 
 # Original sampling rates of the WESAD sensors
 NATIVE_FS = {
@@ -21,9 +21,9 @@ NATIVE_FS = {
 }
 
 # Paths
-DATA_DIR = '/fd24T/zzhao3/EDA/data'
-WESAD_PKL_DIR = '/fd24T/zzhao3/EDA/data/WESAD'
-OUTPUT_DIR = '/fd24T/zzhao3/EDA/preprocessed_data/10s_10s_sid'
+DATA_DIR = '/j-jepa-vol/PULSE/data'
+WESAD_PKL_DIR = '/j-jepa-vol/PULSE/data/WESAD'
+OUTPUT_DIR = '/j-jepa-vol/PULSE/preprocessed_data/60s_0.25s_sid'
 SUBJECT_IDS = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17]
 
 

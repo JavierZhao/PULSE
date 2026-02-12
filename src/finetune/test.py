@@ -557,7 +557,7 @@ def main():
     parser.add_argument('--ckpt_name', type=str, default='best_model.pt', help='(unused now) expected checkpoint filename inside run_dir')
     parser.add_argument('--device', type=str, default='cuda:0' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--batch_size', type=int, default=256)
-    parser.add_argument('--data_path', type=str, default="/fd24T/zzhao3/EDA/preprocessed_data/60s_0.25s_sid", help='Optional override of data_path from log')
+    parser.add_argument('--data_path', type=str, default="/j-jepa-vol/PULSE/preprocessed_data/60s_0.25s_sid", help='Optional override of data_path from log')
     parser.add_argument('--fold_number', type=int, default=None, help='Optional override of fold_number from log')
     parser.add_argument('--include_eda', action='store_true', help='Include EDA encoder during evaluation if available')
     parser.add_argument('--modalities', type=str, default='all', help='Comma-separated list {ecg,bvp,acc,temp,eda} or "all"; if omitted, infer from checkpoint/log')

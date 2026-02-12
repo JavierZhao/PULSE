@@ -49,9 +49,40 @@ pip install -r requirements.txt
 
 ## 3) Data Preparation (LOSO time-series)
 
-Prepare WESAD data in a directory with:
-- Raw CSVs per subject: `SXX_raw_data/*.csv`
-- Original pickle files: `WESAD/SXX/SXX.pkl`
+### Step 1: Download WESAD Dataset
+
+Download the WESAD dataset:
+
+```bash
+mkdir data
+cd data
+wget --content-disposition "https://uni-siegen.sciebo.de/s/HGdUkoNlW1Ub0Gx/download"
+cd ..
+```
+
+This will download `WESAD.zip` to the `data/` directory.
+
+### Step 2: Extract WESAD Dataset
+
+Extract the WESAD dataset to `data/WESAD/`:
+
+```bash
+unzip data/WESAD.zip -d data/
+```
+
+This will create the directory structure: `data/WESAD/SXX/SXX.pkl` for all subjects.
+
+### Step 3: Generate Raw CSV Files
+
+Convert the pickle files to raw CSVs using the data wrangling script:
+
+```bash
+python src/data/data_wrangling.py --mode raw
+```
+
+This creates `data/SXX_raw_data/*.csv` directories with sensor data for each subject (ECG, BVP, EDA, temperature, accelerometer).
+
+### Step 4: Preprocess Data into LOSO Folds
 
 Edit `src/data/preprocess.py` to set:
 - `DATA_DIR`, `WESAD_PKL_DIR`, `OUTPUT_DIR`

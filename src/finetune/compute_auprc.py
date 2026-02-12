@@ -300,7 +300,7 @@ def main():
     parser.add_argument('--run_dir', type=str, required=True, help='Run dir with checkpoint/log, or a parent dir containing multiple run subdirs')
     parser.add_argument('--device', type=str, default='cuda:0' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--batch_size', type=int, default=256)
-    parser.add_argument('--data_path', type=str, default="/fd24T/zzhao3/EDA/preprocessed_data/60s_0.25s_sid")
+    parser.add_argument('--data_path', type=str, default="/j-jepa-vol/PULSE/preprocessed_data/60s_0.25s_sid")
     parser.add_argument('--fold_number', type=int, default=None)
     parser.add_argument('--include_eda', action='store_true')
     args = parser.parse_args()

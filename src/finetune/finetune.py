@@ -354,7 +354,7 @@ def train(args, pretrained_run_name=None):
                 ckpt_path = file_candidate
         else:
             # Legacy behavior: assume a run name under results/cheap_maes/<name>/models/best_ckpt.pt
-            legacy = os.path.join('/fd24T/zzhao3/EDA/results/cheap_maes', candidate, 'models', 'best_ckpt.pt')
+            legacy = os.path.join('/j-jepa-vol/PULSE/results/cheap_maes', candidate, 'models', 'best_ckpt.pt')
             if os.path.isfile(legacy):
                 ckpt_path = legacy
         if ckpt_path is None:
@@ -545,8 +545,8 @@ def main():
     parser.add_argument('--run_name', type=str, default=datetime.now().strftime("%Y%m%d_%H%M%S_finetune"))
     parser.add_argument('--save_name', type=str, default=datetime.now().strftime("%Y%m%d_%H%M%S_finetune"))
     parser.add_argument('--tag', type=str, default="", help='Optional tag to append to the run name.')
-    parser.add_argument('--data_path', type=str, default="/fd24T/zzhao3/EDA/preprocessed_data/60s_0.25s_sid", help='Path to the WESAD preprocessed data directory')
-    parser.add_argument('--output_path', type=str, default="/fd24T/zzhao3/EDA/results/finetuned_models", help='Directory to save logs and models')    
+    parser.add_argument('--data_path', type=str, default="/j-jepa-vol/PULSE/preprocessed_data/60s_0.25s_sid", help='Path to the WESAD preprocessed data directory')
+    parser.add_argument('--output_path', type=str, default="/j-jepa-vol/PULSE/results/finetuned_models", help='Directory to save logs and models')    
     # Data and training settings
     parser.add_argument('--fold_number', type=int, default=17, help='The fold number to use for training/validation (this is the test subject).')
     parser.add_argument('--val_subject_id', type=int, default=16, help='The subject ID to use for the validation set.')

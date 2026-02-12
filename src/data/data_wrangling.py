@@ -7,9 +7,16 @@ from scipy import stats
 import scipy.signal as scisig
 import scipy.stats
 import sys
-sys.path.append('/fd24T/zzhao3/EDA/cvxEDA/src')  # Adjust path as needed
-from cvxEDA import cvxEDA
 import argparse
+
+# Optional cvxEDA import (only needed for feature extraction, not raw data export)
+try:
+    sys.path.append('/fd24T/zzhao3/EDA/cvxEDA/src')  # Adjust path as needed
+    from cvxEDA import cvxEDA
+    CVXEDA_AVAILABLE = True
+except ImportError:
+    CVXEDA_AVAILABLE = False
+    print("Warning: cvxEDA not available. Feature extraction will not work.")
 
 # E4 (wrist) Sampling Frequencies
 fs_dict = {'ACC': 32, 'BVP': 64, 'EDA': 4, 'TEMP': 4, 'label': 700, 'Resp': 700}
@@ -27,6 +34,8 @@ if not os.path.exists(savePath + subject_feature_path):
 
 # cvxEDA
 def eda_stats(y):
+    if not CVXEDA_AVAILABLE:
+        raise ImportError("cvxEDA is not available. Cannot perform EDA decomposition.")
     Fs = fs_dict['EDA']
     yn = (y - y.mean()) / y.std()
     [r, p, t, l, d, e, obj] = cvxEDA(yn, 1. / Fs)
@@ -226,7 +235,7 @@ def get_samples(data, n_windows, label):
 
 def get_raw_data(subject_id):
     # Make subject data object for Sx
-    subject = SubjectData(main_path='/fd24T/zzhao3/EDA/data/WESAD', subject_number=subject_id)
+    subject = SubjectData(main_path='/j-jepa-vol/PULSE/data/WESAD', subject_number=subject_id)
     
     # Get wrist and chest data
     wrist_data = subject.get_wrist_data()
@@ -264,7 +273,7 @@ def make_patient_data(subject_id):
     global WINDOW_IN_SECONDS
 
     # Make subject data object for Sx
-    subject = SubjectData(main_path='/fd24T/zzhao3/EDA/data/WESAD', subject_number=subject_id)
+    subject = SubjectData(main_path='/j-jepa-vol/PULSE/data/WESAD', subject_number=subject_id)
 
     # Empatica E4 data - now with resp
     e4_data_dict = subject.get_wrist_data()
