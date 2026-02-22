@@ -29,6 +29,7 @@ import logging
 from tqdm import tqdm
 import pandas as pd
 import numpy as np
+from torch.utils.tensorboard import SummaryWriter
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
@@ -122,6 +123,11 @@ def train(args):
 
     best_val_loss = float('inf')
     all_losses = []
+
+    # --- TensorBoard ---
+    tb_dir = os.path.join(run_output_path, "tensorboard")
+    writer = SummaryWriter(log_dir=tb_dir)
+    logging.info(f"TensorBoard logs: {tb_dir}")
 
     for epoch in range(args.num_epochs):
         logging.info(f"--- Epoch {epoch+1}/{args.num_epochs} ---")
@@ -225,6 +231,18 @@ def train(args):
             f"Val VICReg: {avg_val_vic:.4f} Align: {avg_val_align:.4f}"
         )
 
+        # --- TensorBoard scalars ---
+        writer.add_scalar('Loss/train_vicreg', avg_tr['vicreg'], epoch + 1)
+        writer.add_scalar('Loss/train_align', avg_tr['align'], epoch + 1)
+        writer.add_scalar('Loss/train_invariance', avg_tr['inv'], epoch + 1)
+        writer.add_scalar('Loss/train_variance', avg_tr['var'], epoch + 1)
+        writer.add_scalar('Loss/train_covariance', avg_tr['cov'], epoch + 1)
+        writer.add_scalar('Loss/val_vicreg', avg_val_vic, epoch + 1)
+        writer.add_scalar('Loss/val_align', avg_val_align, epoch + 1)
+        writer.add_scalar('Loss/val_total', avg_val_total, epoch + 1)
+        current_lr = next(iter(schedulers.values())).get_last_lr()[0]
+        writer.add_scalar('LR', current_lr, epoch + 1)
+
         all_losses.append({
             'epoch': epoch + 1,
             'train_vicreg': avg_tr['vicreg'], 'train_align': avg_tr['align'],
@@ -238,6 +256,7 @@ def train(args):
                             best_val_loss, all_losses,
                             os.path.join(models_path, "best_ckpt.pt"))
 
+    writer.close()
     logging.info("VICReg pretraining complete.")
     losses_df = pd.DataFrame(all_losses)
     np.savez(os.path.join(run_output_path, "losses.npz"),

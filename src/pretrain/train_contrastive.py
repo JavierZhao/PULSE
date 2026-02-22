@@ -29,6 +29,7 @@ import logging
 from tqdm import tqdm
 import pandas as pd
 import numpy as np
+from torch.utils.tensorboard import SummaryWriter
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
@@ -121,6 +122,11 @@ def train(args):
     best_val_loss = float('inf')
     all_losses = []
 
+    # --- TensorBoard ---
+    tb_dir = os.path.join(run_output_path, "tensorboard")
+    writer = SummaryWriter(log_dir=tb_dir)
+    logging.info(f"TensorBoard logs: {tb_dir}")
+
     for epoch in range(args.num_epochs):
         logging.info(f"--- Epoch {epoch+1}/{args.num_epochs} ---")
 
@@ -204,6 +210,15 @@ def train(args):
         logging.info(f"Epoch {epoch+1} | Train Contrastive: {avg_train_c:.4f} Align: {avg_train_a:.4f} | "
                      f"Val Contrastive: {avg_val_c:.4f} Align: {avg_val_a:.4f}")
 
+        # --- TensorBoard scalars ---
+        writer.add_scalar('Loss/train_contrastive', avg_train_c, epoch + 1)
+        writer.add_scalar('Loss/train_align', avg_train_a, epoch + 1)
+        writer.add_scalar('Loss/val_contrastive', avg_val_c, epoch + 1)
+        writer.add_scalar('Loss/val_align', avg_val_a, epoch + 1)
+        writer.add_scalar('Loss/val_total', avg_val_total, epoch + 1)
+        current_lr = next(iter(schedulers.values())).get_last_lr()[0]
+        writer.add_scalar('LR', current_lr, epoch + 1)
+
         all_losses.append({
             'epoch': epoch + 1,
             'train_contrastive': avg_train_c, 'train_align': avg_train_a,
@@ -216,6 +231,7 @@ def train(args):
                             best_val_loss, all_losses,
                             os.path.join(models_path, "best_ckpt.pt"))
 
+    writer.close()
     logging.info("Contrastive pretraining complete.")
     losses_df = pd.DataFrame(all_losses)
     np.savez(os.path.join(run_output_path, "losses.npz"),

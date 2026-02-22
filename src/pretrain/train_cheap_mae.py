@@ -9,6 +9,7 @@ import logging
 from tqdm import tqdm
 import pandas as pd
 import numpy as np
+from torch.utils.tensorboard import SummaryWriter
 
 # Add the project root to the Python path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
@@ -340,7 +341,12 @@ def train(args):
     vis_batch = next(iter(val_dataloader))
     
     alignment_loss_fn = AllPairsHingeLoss(alpha=args.hinge_alpha, neg_sample_percent=args.hinge_neg_sample_percent)
-    
+
+    # --- TensorBoard ---
+    tb_dir = os.path.join(run_output_path, "tensorboard")
+    writer = SummaryWriter(log_dir=tb_dir)
+    logging.info(f"TensorBoard logs: {tb_dir}")
+
     for epoch in range(start_epoch, args.num_epochs):
         logging.info(f"--- Epoch {epoch+1}/{args.num_epochs} ---")
         
@@ -458,12 +464,23 @@ def train(args):
                               mask_ratio=args.mask_ratio)
         logging.info(f"Epoch {epoch+1} | Train Loss: {avg_train_total_loss:.4f} (Align: {avg_train_align_loss:.4f}, Disent: {avg_train_disent_loss:.4f}) | Val Loss: {val_losses['total']:.4f} (Align: {val_losses['align']:.4f}, Disent: {val_losses['disent']:.4f})")
 
+        # --- TensorBoard scalars ---
+        writer.add_scalar('Loss/train_total', avg_train_total_loss, epoch + 1)
+        writer.add_scalar('Loss/train_recon', avg_train_recon_loss, epoch + 1)
+        writer.add_scalar('Loss/train_align', avg_train_align_loss, epoch + 1)
+        writer.add_scalar('Loss/train_disent', avg_train_disent_loss, epoch + 1)
+        writer.add_scalar('Loss/val_total', val_losses['total'], epoch + 1)
+        writer.add_scalar('Loss/val_recon', val_losses['recon'], epoch + 1)
+        writer.add_scalar('Loss/val_align', val_losses['align'], epoch + 1)
+        writer.add_scalar('Loss/val_disent', val_losses['disent'], epoch + 1)
+
         # Update learning rate
         for sch in schedulers.values():
             sch.step()
 
         # --- Save Losses and Checkpoints ---
-        current_lr = next(iter(schedulers.values())).get_last_lr()[0] # Get LR from one of the schedulers
+        current_lr = next(iter(schedulers.values())).get_last_lr()[0]
+        writer.add_scalar('LR', current_lr, epoch + 1)
         losses.append({
             'epoch': epoch + 1,
             'train_total_loss': avg_train_total_loss, 'train_recon_loss': avg_train_recon_loss, 'train_align_loss': avg_train_align_loss, 'train_disent_loss': avg_train_disent_loss,
@@ -500,6 +517,7 @@ def train(args):
             plot_reconstructions(models, vis_batch, device, recon_plot_path)
             logging.info(f"Saved reconstruction plot to {recon_plot_path}")
 
+    writer.close()
     logging.info("Training complete.")
     # --- Final Plot ---
     final_plot_path = os.path.join(run_output_path, "loss_curves.png")
