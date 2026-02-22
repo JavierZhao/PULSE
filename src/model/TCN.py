@@ -122,7 +122,31 @@ class TCNEncoder(nn.Module):
                 mask_ratio: float = 0.0,
                 ids_shuffle=None, ids_restore=None, ids_keep=None,
                 return_hiddens: bool = False):
+        """
+        **Masking strategy for TCN**: Unlike the Transformer MAE where
+        masked tokens are removed from the sequence, the TCN operates on
+        a contiguous temporal grid and cannot skip positions.  Instead we
+        **zero-out masked patches at the input level** before the signal
+        enters the causal convolution stack.  This prevents information
+        leakage from masked patches through the dilated convolutions.
+        """
         B = x.shape[0]
+
+        # --- Apply input-level masking (for pretraining) ---
+        if mask_ratio > 0.0 and ids_restore is not None:
+            N = x.shape[0]
+            L = self.num_patches
+            len_keep = int(L * (1 - mask_ratio))
+            # Build binary mask: 0 = keep, 1 = remove
+            mask = torch.ones(N, L, device=x.device)
+            mask[:, :len_keep] = 0
+            mask = torch.gather(mask, dim=1, index=ids_restore)  # (N, L)
+            # Expand mask to raw signal resolution and zero-out masked patches
+            input_mask = mask.unsqueeze(-1).repeat(1, 1, self.window_len)  # (N, L, W)
+            input_mask = input_mask.reshape(N, 1, -1)  # (N, 1, L*W)
+            x = x * (1.0 - input_mask)
+        else:
+            mask = torch.zeros(B, self.num_patches, device=x.device)
 
         h = self.stem(x)         # (B, C, num_patches)
         h = self.tcn(h)          # (B, C, num_patches)
@@ -130,17 +154,12 @@ class TCNEncoder(nn.Module):
         h = h.transpose(1, 2)    # (B, num_patches, embed_dim)
         h = self.norm(h)
 
-        # --- Optional masking ---
+        # For masked pretraining: keep only unmasked token embeddings
+        # (decoder will reinsert mask tokens at masked positions)
         if mask_ratio > 0.0 and ids_keep is not None:
             N, L, D = h.shape
-            len_keep = int(L * (1 - mask_ratio))
             h = torch.gather(h, dim=1,
                              index=ids_keep.unsqueeze(-1).expand(-1, -1, D))
-            mask = torch.ones(N, L, device=h.device)
-            mask[:, :len_keep] = 0
-            mask = torch.gather(mask, dim=1, index=ids_restore)
-        else:
-            mask = torch.zeros(B, h.shape[1], device=h.device)
 
         # Prepend CLS
         cls = self.cls_token.expand(B, -1, -1)

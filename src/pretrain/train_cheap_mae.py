@@ -14,9 +14,18 @@ import numpy as np
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
 from src.model.CheapSensorMAE import CheapSensorMAE
+from src.model.ResNet1D import ResNet1DMAE
+from src.model.TCN import TCNMAE
 from src.data.wesad_dataset import WESADDataset
 from src.utils import plot_mae_losses, plot_reconstructions
 from src.modules.hinge_loss import AllPairsHingeLoss
+
+# Registry of available backbone architectures for masked reconstruction
+BACKBONE_REGISTRY = {
+    'transformer': CheapSensorMAE,
+    'resnet1d': ResNet1DMAE,
+    'tcn': TCNMAE,
+}
 
 
 def _choose_modalities(
@@ -266,9 +275,14 @@ def train(args):
     if len(modality_names) < 2:
         logging.warning("Only one modality selected. Alignment loss will be skipped in training and validation.")
 
+    backbone_cls = BACKBONE_REGISTRY.get(getattr(args, 'backbone', 'transformer'))
+    if backbone_cls is None:
+        raise ValueError(f"Unknown backbone '{args.backbone}'. Choose from: {list(BACKBONE_REGISTRY.keys())}")
+    logging.info(f"Using backbone: {args.backbone} ({backbone_cls.__name__})")
+
     models = {}
     for name in modality_names:
-        models[name] = CheapSensorMAE(
+        models[name] = backbone_cls(
             modality_name=name,
             sig_len=args.signal_length,
             window_len=args.patch_window_len,
@@ -301,10 +315,10 @@ def train(args):
             logging.info(f"  Validation with Dropout: {args.p_drop_eda} for EDA, {args.p_drop_cheap} for cheap modalities")
         
         # Log model architecture (they are all the same)
-        ecg_model = models['ecg']
+        first_model = next(iter(models.values()))
         logging.info("\nModel Architecture:")
-        logging.info(str(ecg_model))
-        logging.info(f"Total parameters: {sum(p.numel() for p in ecg_model.parameters()):,}")
+        logging.info(str(first_model))
+        logging.info(f"Total parameters: {sum(p.numel() for p in first_model.parameters()):,}")
         logging.info("-" * 50)
 
     # --- Data ---
@@ -458,7 +472,7 @@ def train(args):
             sch.step()
 
         # --- Save Losses and Checkpoints ---
-        current_lr = schedulers['ecg'].get_last_lr()[0] # Get LR from one of the schedulers
+        current_lr = next(iter(schedulers.values())).get_last_lr()[0] # Get LR from one of the schedulers
         losses.append({
             'epoch': epoch + 1,
             'train_total_loss': avg_train_total_loss, 'train_recon_loss': avg_train_recon_loss, 'train_align_loss': avg_train_align_loss, 'train_disent_loss': avg_train_disent_loss,
@@ -509,6 +523,8 @@ def main():
     parser.add_argument('--output_path', type=str, default="/j-jepa-vol/PULSE/results/cheap_maes", help='Directory to save logs and models')
     parser.add_argument('--fold_number', type=int, default=17, help='The fold number to use for training/validation')
     parser.add_argument('--resume_from', type=str, default=None, help='Path to a checkpoint file to resume training from.')
+    parser.add_argument('--backbone', type=str, default='transformer', choices=list(BACKBONE_REGISTRY.keys()),
+                        help='Encoder backbone architecture: transformer (default MAE), resnet1d, or tcn.')
     parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
     parser.add_argument('--dataset_percentage', type=float, default=1.0, help="Percentage of the dataset to use (0.0 to 1.0). Default: 1.0")
     parser.add_argument('--alignment_loss_weight', type=float, default=1.0, help="Weight for the alignment loss component.")

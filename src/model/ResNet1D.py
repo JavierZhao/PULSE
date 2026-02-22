@@ -122,31 +122,51 @@ class ResNet1DEncoder(nn.Module):
 
         During finetuning ``mask_ratio`` is set to 0 and ids_* are dummies
         produced by ``propose_masking``.
+
+        **Masking strategy for CNNs**: Unlike the Transformer MAE where
+        masked tokens are simply removed from the input sequence, a CNN
+        processes a contiguous spatial grid and cannot skip positions.
+        Instead we **zero-out masked patches at the input level** before
+        the signal enters the convolutional layers.  This prevents
+        information leakage from masked patches through the convolutions
+        and makes the reconstruction task non-trivial.
         """
         B = x.shape[0]
 
-        # (B, 1, L) → (B, C, num_patches) → stages → proj → (B, embed_dim, T)
+        # --- Apply input-level masking (for pretraining) ---
+        if mask_ratio > 0.0 and ids_restore is not None:
+            N = x.shape[0]
+            L = self.num_patches
+            len_keep = int(L * (1 - mask_ratio))
+            # Build binary mask: 0 = keep, 1 = remove
+            mask = torch.ones(N, L, device=x.device)
+            mask[:, :len_keep] = 0
+            mask = torch.gather(mask, dim=1, index=ids_restore)  # (N, L)
+            # Expand mask to raw signal resolution and zero-out masked patches
+            # mask shape: (N, L) → (N, 1, L*window_len)
+            input_mask = mask.unsqueeze(-1).repeat(1, 1, self.window_len)  # (N, L, W)
+            input_mask = input_mask.reshape(N, 1, -1)  # (N, 1, L*W)
+            x = x * (1.0 - input_mask)  # zero out masked patches
+        else:
+            mask = torch.zeros(B, self.num_patches, device=x.device)
+
+        # (B, 1, L_sig) → stem → stages → proj → (B, embed_dim, T)
         h = self.stem(x)
         h = self.stages(h)
         h = self.proj(h)  # (B, embed_dim, T)
         h = h.transpose(1, 2)  # (B, T, embed_dim)
         h = self.norm(h)
 
-        # --- Optional masking (for pretraining) ---
+        # For masked pretraining: keep only unmasked token embeddings
+        # (decoder will reinsert mask tokens at masked positions)
         if mask_ratio > 0.0 and ids_keep is not None:
             N, L, D = h.shape
-            len_keep = int(L * (1 - mask_ratio))
             h = torch.gather(h, dim=1,
                              index=ids_keep.unsqueeze(-1).expand(-1, -1, D))
-            mask = torch.ones(N, L, device=h.device)
-            mask[:, :len_keep] = 0
-            mask = torch.gather(mask, dim=1, index=ids_restore)
-        else:
-            mask = torch.zeros(B, h.shape[1], device=h.device)
 
         # Prepend CLS token
         cls = self.cls_token.expand(B, -1, -1)
-        h = torch.cat([cls, h], dim=1)  # (B, T+1, embed_dim)
+        h = torch.cat([cls, h], dim=1)  # (B, T_kept+1, embed_dim)
 
         # Split into private / shared
         private_embedding = h * self.private_mask
