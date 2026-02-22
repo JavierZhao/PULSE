@@ -13,19 +13,10 @@ import numpy as np
 # Add the project root to the Python path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
-from src.model.CheapSensorMAE import CheapSensorMAE
-from src.model.ResNet1D import ResNet1DMAE
-from src.model.TCN import TCNMAE
+from src.model.backbone_registry import MAE_BACKBONE_REGISTRY as BACKBONE_REGISTRY
 from src.data.wesad_dataset import WESADDataset
 from src.utils import plot_mae_losses, plot_reconstructions
 from src.modules.hinge_loss import AllPairsHingeLoss
-
-# Registry of available backbone architectures for masked reconstruction
-BACKBONE_REGISTRY = {
-    'transformer': CheapSensorMAE,
-    'resnet1d': ResNet1DMAE,
-    'tcn': TCNMAE,
-}
 
 
 def _choose_modalities(

@@ -14,7 +14,7 @@ from sklearn.metrics import f1_score, accuracy_score, roc_auc_score, average_pre
 # Add the project root to the Python path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
-from src.model.CheapSensorMAE import CheapSensorMAE
+from src.model.backbone_registry import BACKBONE_REGISTRY, get_backbone_class
 from src.data.wesad_dataset import WESADDataset
 
 class StressClassifier(nn.Module):
@@ -149,22 +149,21 @@ def setup_logging(run_name, output_path):
     logger.addHandler(console_handler)
 
 
-def load_pretrained_models(path, device, model_args, modalities=None):
-    """Loads the pretrained MAE models from a checkpoint file."""
-    # if not os.path.isfile(path):
-    #     raise FileNotFoundError(f"Checkpoint file not found at {path}")
-        
+def load_pretrained_models(path, device, model_args, modalities=None, backbone='transformer'):
+    """Loads the pretrained models from a checkpoint file."""
+    backbone_cls = get_backbone_class(backbone)
+
     checkpoint = torch.load(path, map_location=device)
-    
+
     selected = modalities if modalities is not None else ['ecg', 'bvp', 'acc', 'temp']
     models = {}
     for name in selected:
-        model = CheapSensorMAE(modality_name=name, **model_args).to(device)
+        model = backbone_cls(modality_name=name, **model_args).to(device)
         model_state_dict = checkpoint[f'{name}_model_state_dict'] if name != 'eda' else checkpoint[f'model_state_dict']
         model.load_state_dict(model_state_dict)
         models[name] = model
-        
-    logging.info(f"Loaded pretrained models from {path} for modalities={selected}")
+
+    logging.info(f"Loaded pretrained models ({backbone}) from {path} for modalities={selected}")
     return models
 
 def validate(model, dataloader, criterion, device, three_class=False):
@@ -333,10 +332,13 @@ def train(args, pretrained_run_name=None):
         'decoder_mlp_ratio': args.decoder_mlp_ratio
     }
     
+    backbone_cls = get_backbone_class(args.backbone)
+    logging.info(f"Using backbone: {args.backbone} ({backbone_cls.__name__})")
+
     if args.from_scratch:
         logging.info("--- Training from Scratch ---")
         base_models = {
-            name: CheapSensorMAE(modality_name=name, **model_args).to(device)
+            name: backbone_cls(modality_name=name, **model_args).to(device)
             for name in modalities
         }
     else:
@@ -360,7 +362,7 @@ def train(args, pretrained_run_name=None):
         if ckpt_path is None:
             raise FileNotFoundError(f"Could not resolve pretrained checkpoint from run_name='{args.run_name}'. Provide a full path to a file or models dir, or ensure legacy path exists.")
         args.pretrained_ckpt_path = ckpt_path
-        base_models = load_pretrained_models(ckpt_path, device, model_args, modalities)
+        base_models = load_pretrained_models(ckpt_path, device, model_args, modalities, backbone=args.backbone)
 
     # --- Create Classifier ---
     model = StressClassifier(
@@ -559,6 +561,8 @@ def main():
     parser.add_argument('--head_lr', type=float, default=1e-3, help="Learning rate for the classification head")
     parser.add_argument('--freeze_backbone', action='store_true', help="Freeze the MAE backbones and only train the classifier head")
     parser.add_argument('--from_scratch', action='store_true', help='Train from scratch without loading pretrained weights.')
+    parser.add_argument('--backbone', type=str, default='transformer', choices=sorted(BACKBONE_REGISTRY.keys()),
+                        help='Encoder backbone architecture (must match pretrained checkpoint).')
     parser.add_argument('--lr_restart_epochs', type=int, default=10, help='Number of epochs to restart the learning rate')
     parser.add_argument('--t_mult', type=int, default=2, help='Multiplier for the learning rate scheduler')
     parser.add_argument('--linear_classifier', action='store_true', help='Use a linear classifier instead of a MLP')

@@ -16,7 +16,7 @@ from tqdm import tqdm
 # Ensure project root on path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
-from src.model.CheapSensorMAE import CheapSensorMAE
+from src.model.backbone_registry import BACKBONE_REGISTRY, get_backbone_class
 from src.data.wesad_dataset import WESADDataset
 from src.utils import plot_kd_losses
 
@@ -398,7 +398,12 @@ def train(args):
         student_modalities = parsed
 
     # Instantiate teacher and students
-    teacher = CheapSensorMAE(
+    teacher_backbone_cls = get_backbone_class(args.teacher_backbone)
+    student_backbone_cls = get_backbone_class(args.backbone)
+    logging.info(f"Teacher backbone: {args.teacher_backbone} ({teacher_backbone_cls.__name__})")
+    logging.info(f"Student backbone: {args.backbone} ({student_backbone_cls.__name__})")
+
+    teacher = teacher_backbone_cls(
         modality_name='eda',
         sig_len=args.signal_length,
         window_len=args.patch_window_len,
@@ -409,7 +414,7 @@ def train(args):
     for p in teacher.parameters():
         p.requires_grad_(False)
 
-    students = {name: CheapSensorMAE(
+    students = {name: student_backbone_cls(
         modality_name=name,
         sig_len=args.signal_length,
         window_len=args.patch_window_len,
@@ -722,7 +727,7 @@ def parse_layers(s):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Knowledge Distillation: EDA teacher -> 4 CheapSensorMAE students')
+    parser = argparse.ArgumentParser(description='Knowledge Distillation: EDA teacher -> student models')
     parser.add_argument('--run_name', type=str, default=datetime.now().strftime("%Y%m%d_%H%M%S"))
     parser.add_argument('--data_path', type=str, default="/j-jepa-vol/PULSE/preprocessed_data/60s_0.25s_sid")
     parser.add_argument('--output_path', type=str, default="/j-jepa-vol/PULSE/results/kd")
@@ -733,6 +738,11 @@ def main():
     parser.add_argument('--device', type=str, default='cuda:0' if torch.cuda.is_available() else 'cpu')
     # Modalities selection (like pretrain/finetune)
     parser.add_argument('--modalities', type=str, default='all', help='Comma-separated list of student modalities from {ecg,bvp,acc,temp}, or "all"')
+    # Backbone selection
+    parser.add_argument('--backbone', type=str, default='transformer', choices=sorted(BACKBONE_REGISTRY.keys()),
+                        help='Encoder backbone architecture for student models.')
+    parser.add_argument('--teacher_backbone', type=str, default='transformer', choices=sorted(BACKBONE_REGISTRY.keys()),
+                        help='Encoder backbone architecture for the teacher model.')
 
     # Model sizes
     parser.add_argument('--signal_length', type=int, default=3840)

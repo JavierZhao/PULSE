@@ -29,7 +29,7 @@ import pandas as pd
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
 from src.data.wesad_dataset import WESADDataset
-from src.model.CheapSensorMAE import CheapSensorMAE
+from src.model.backbone_registry import BACKBONE_REGISTRY, get_backbone_class
 from src.finetune.finetune import StressClassifier
 from src.finetune.summarize_folds import find_fold_dirs, load_metrics, parse_fold_id, aggregate_metrics
 
@@ -147,8 +147,9 @@ def build_model_from_args(
     modalities: Optional[List[str]] = None,
     num_classes: int = 1,
     adaptive_fusion: bool = False,
+    backbone: Optional[str] = None,
 ) -> StressClassifier:
-    """Construct StressClassifier with base CheapSensorMAE models using args from log and selected modalities."""
+    """Construct StressClassifier with base models using args from log and selected modalities."""
     model_args = {
         'sig_len': int(args_dict.get('signal_length', 3840)),
         'window_len': int(args_dict.get('patch_window_len', 96)),
@@ -170,8 +171,12 @@ def build_model_from_args(
         else:
             selected_modalities = [mod_from_log]
 
+    # Resolve backbone: CLI override > logged arg > default
+    backbone_name = backbone or str(args_dict.get('backbone', 'transformer'))
+    backbone_cls = get_backbone_class(backbone_name)
+
     base_models = {
-        name: CheapSensorMAE(modality_name=name, **model_args).to(device)
+        name: backbone_cls(modality_name=name, **model_args).to(device)
         for name in selected_modalities
     }
     only_shared = only_shared_override if only_shared_override is not None else _to_bool(args_dict.get('only_shared', False))
@@ -379,6 +384,7 @@ def evaluate_run_dir(
     fold_number: Optional[int],
     include_eda: bool = False,
     modalities_override: Optional[List[str]] = None,
+    backbone_override: Optional[str] = None,
 ):
     log_path = os.path.join(run_dir, 'finetune.log')
     ckpt_path = os.path.join(run_dir, 'best_model.pt')
@@ -455,6 +461,7 @@ def evaluate_run_dir(
         modalities=selected_modalities,
         num_classes=num_classes,
         adaptive_fusion=has_adaptive,
+        backbone=backbone_override,
     )
 
     try:
@@ -561,6 +568,8 @@ def main():
     parser.add_argument('--fold_number', type=int, default=None, help='Optional override of fold_number from log')
     parser.add_argument('--include_eda', action='store_true', help='Include EDA encoder during evaluation if available')
     parser.add_argument('--modalities', type=str, default='all', help='Comma-separated list {ecg,bvp,acc,temp,eda} or "all"; if omitted, infer from checkpoint/log')
+    parser.add_argument('--backbone', type=str, default=None, choices=sorted(BACKBONE_REGISTRY.keys()),
+                        help='Encoder backbone architecture override. If omitted, infer from finetune log.')
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -579,6 +588,7 @@ def main():
                 args.fold_number,
                 include_eda=args.include_eda,
                 modalities_override=cli_modalities,
+                backbone_override=args.backbone,
             )
         except Exception as e:
             print(f"Error evaluating {args.run_dir}: {e}")
@@ -601,6 +611,7 @@ def main():
                 args.fold_number,
                 include_eda=args.include_eda,
                 modalities_override=cli_modalities,
+                backbone_override=args.backbone,
             )
         except Exception as e:
             print(f"Error evaluating {sub}: {e}")
