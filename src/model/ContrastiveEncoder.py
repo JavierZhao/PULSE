@@ -102,15 +102,17 @@ class NTXentLoss(nn.Module):
         z = torch.cat([z1, z2], dim=0)  # (2B, D)
         sim = torch.mm(z, z.t()) / self.temperature  # (2B, 2B)
 
-        # Mask out self-similarity
-        mask = ~torch.eye(2 * B, dtype=torch.bool, device=z.device)
-        sim = sim.masked_select(mask).view(2 * B, -1)  # (2B, 2B-1)
+        # Mask out self-similarity by filling the diagonal with -inf.
+        # masked_fill is used instead of masked_select so that the (2B, 2B)
+        # shape is preserved, avoiding the masked_select scatter-backward
+        # which causes "CUDA error: invalid argument" on some GPU configs.
+        sim = sim.masked_fill(torch.eye(2 * B, dtype=torch.bool, device=z.device), float('-inf'))
 
-        # Positive pair indices: for i in [0..B-1], positive is at index B-1+i
-        # because after removing self, the partner (at original index B+i) is
-        # at position B-1+i in the masked row.  Similarly for i in [B..2B-1].
+        # Positive pair indices in the full (2B, 2B) matrix:
+        #   z1[i] (row i)       -> positive is z2[i] at column B+i
+        #   z2[i] (row B+i)     -> positive is z1[i] at column i
         pos_idx = torch.cat([
-            torch.arange(B - 1, 2 * B - 1, device=z.device),
+            torch.arange(B, 2 * B, device=z.device),
             torch.arange(0, B, device=z.device),
         ])
 
