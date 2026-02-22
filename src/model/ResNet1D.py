@@ -55,7 +55,7 @@ class ResNet1DEncoder(nn.Module):
 
     def __init__(self, sig_len: int = 3840, window_len: int = 96,
                  in_chans: int = 1, embed_dim: int = 1024,
-                 base_channels: int = 64, num_blocks_per_stage: int = 2,
+                 base_channels: int = 232, num_blocks_per_stage: int = 2,
                  kernel_size: int = 7, private_mask_ratio: float = 0.5):
         super().__init__()
 
@@ -238,7 +238,7 @@ class ResNet1DMAE(nn.Module):
                  norm_layer=nn.LayerNorm, norm_pix_loss: bool = True,
                  private_mask_ratio: float = 0.5,
                  # ResNet-specific
-                 base_channels: int = 64, num_blocks_per_stage: int = 2,
+                 base_channels: int = 232, num_blocks_per_stage: int = 2,
                  kernel_size: int = 7):
         super().__init__()
         print(f"Initializing ResNet1DMAE for {modality_name}")

@@ -75,7 +75,7 @@ class TCNEncoder(nn.Module):
 
     def __init__(self, sig_len: int = 3840, window_len: int = 96,
                  in_chans: int = 1, embed_dim: int = 1024,
-                 tcn_channels: int = 256, num_layers: int = 6,
+                 tcn_channels: int = 1520, num_layers: int = 6,
                  kernel_size: int = 3, dropout: float = 0.1,
                  private_mask_ratio: float = 0.5):
         super().__init__()
@@ -223,7 +223,7 @@ class TCNMAE(nn.Module):
                  norm_layer=nn.LayerNorm, norm_pix_loss: bool = True,
                  private_mask_ratio: float = 0.5,
                  # TCN-specific
-                 tcn_channels: int = 256, kernel_size: int = 3,
+                 tcn_channels: int = 1520, kernel_size: int = 3,
                  dropout: float = 0.1):
         super().__init__()
         print(f"Initializing TCNMAE for {modality_name}")
