@@ -3,6 +3,7 @@ data/
 preprocessed_data/
 output/
 results/
+k8s/
 
 # Python
 __pycache__/
@@ -11,6 +12,7 @@ __pycache__/
 *.pyc
 # Jupyter Notebook
 .ipynb_checkpoints
+*.DS_Store
 
 # Environment
 .env
