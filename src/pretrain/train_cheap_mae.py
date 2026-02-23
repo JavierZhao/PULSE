@@ -474,10 +474,6 @@ def train(args):
         writer.add_scalar('Loss/val_align', val_losses['align'], epoch + 1)
         writer.add_scalar('Loss/val_disent', val_losses['disent'], epoch + 1)
 
-        # Update learning rate
-        for sch in schedulers.values():
-            sch.step()
-
         # --- Save Losses and Checkpoints ---
         current_lr = next(iter(schedulers.values())).get_last_lr()[0]
         writer.add_scalar('LR', current_lr, epoch + 1)
