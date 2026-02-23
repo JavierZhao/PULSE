@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 from typing import Optional
+from .model_utils.pos_embed import get_1d_sincos_pos_embed
 
 
 class ResidualBlock1D(nn.Module):
@@ -191,6 +192,15 @@ class ResNet1DDecoder(nn.Module):
         self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_dim))
         nn.init.normal_(self.mask_token, std=0.02)
 
+        # Fixed sincos positional embeddings — same scheme as CheapSensorMAE.Decoder.
+        # Without these, every masked token is identical (same mask_token constant) and
+        # the position-independent MLP predicts the same value for all masked patches,
+        # making reconstruction impossible.
+        self.pos_embed = nn.Parameter(
+            torch.zeros(1, num_patches, decoder_dim), requires_grad=False)
+        pos_emb = get_1d_sincos_pos_embed(decoder_dim, num_patches, cls_token=False)
+        self.pos_embed.data.copy_(torch.from_numpy(pos_emb).float().unsqueeze(0))
+
         layers = []
         for _ in range(num_layers):
             layers += [nn.Linear(decoder_dim, decoder_dim), nn.GELU()]
@@ -209,8 +219,9 @@ class ResNet1DDecoder(nn.Module):
             index=ids_restore.unsqueeze(-1).expand(-1, -1, x.shape[2]))
         x = torch.cat([x[:, :1, :], x_], dim=1)  # re-add cls
 
-        # Remove cls, predict
+        # Remove cls, add positional embeddings, predict
         x = x[:, 1:, :]
+        x = x + self.pos_embed  # give each position a unique signal before the MLP
         x = self.mlp(x)
         return x
 
