@@ -69,6 +69,11 @@ def save_checkpoint(epoch, models, optimizers, schedulers, best_val_loss, losses
 
 
 def train(args):
+    # Flash Attention 2 on RTX 3090/4090 requires seqlen % 8 == 0; the full
+    # unmasked sequence (40 patches + CLS = 41) violates this and causes
+    # "CUDA error: invalid argument" asynchronously reported at loss.backward().
+    torch.backends.cuda.enable_flash_sdp(False)
+
     device = torch.device(args.device)
     run_output_path = os.path.join(args.output_path, args.run_name)
     models_path = os.path.join(run_output_path, "models")
