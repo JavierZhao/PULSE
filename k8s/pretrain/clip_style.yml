@@ -45,7 +45,7 @@ spec:
                 --output_path /j-jepa-vol/PULSE/results/pretrain_baselines \
                 --fold_number 17 \
                 --num_epochs 100 \
-                --batch_size 128 \
+                --batch_size 64 \
                 --device cuda:0
           resources:
             limits:
@@ -87,8 +87,3 @@ spec:
                       - gpn-fiona-mizzou-2.rnet.missouri.edu
                       - rci-nrp-gpu-05.sdsu.edu
                       - node-2-2.sdsc.optiputer.net
-                  - key: nvidia.com/gpu.product
-                    operator: In
-                    values:
-                      - NVIDIA-GeForce-RTX-3090
-                      - NVIDIA-GeForce-RTX-4090
