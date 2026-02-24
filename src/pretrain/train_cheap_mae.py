@@ -134,19 +134,56 @@ def load_checkpoint(path, models, optimizers, schedulers, device):
     logging.info(f"Resumed from epoch {epoch}. Best validation loss was {best_val_loss:.4f}.")
     return epoch, best_val_loss, losses
 
-def validate(models, dataloader, device, alignment_loss_fn, alignment_loss_weight, disentangling_loss_weight=0.0, use_curriculum=False, epoch=0, num_epochs=1, enable_modality_dropout: bool=False, p_drop_eda: float=0.0, p_drop_cheap: float=0.0, val_without_eda: bool=False, val_with_dropout: bool=False, mask_ratio: float=0.75):
+def resolve_loss_hyperparams(args):
+    """Fill in backbone-aware defaults when weights are omitted from CLI."""
+    if args.alignment_loss_weight is None:
+        args.alignment_loss_weight = 1.0 if args.backbone == 'transformer' else 0.05
+    if args.alignment_loss_weight < 0:
+        raise ValueError("alignment_loss_weight must be non-negative.")
+    if args.alignment_warmup_epochs is None:
+        if args.use_curriculum or args.backbone == 'transformer':
+            args.alignment_warmup_epochs = 0
+        else:
+            args.alignment_warmup_epochs = 10
+    if args.alignment_warmup_epochs < 0:
+        raise ValueError("alignment_warmup_epochs must be non-negative.")
+
+
+def compute_loss_weights(
+    epoch: int,
+    num_epochs: int,
+    use_curriculum: bool,
+    alignment_loss_weight: float,
+    alignment_warmup_epochs: int,
+):
+    if use_curriculum:
+        ratio = (epoch + 1) / num_epochs
+        align_weight = np.sin(ratio * np.pi / 2)
+        recon_weight = np.cos(ratio * np.pi / 2)
+        return recon_weight, align_weight
+
+    recon_weight = 1.0
+    if alignment_warmup_epochs > 0:
+        warmup_scale = min(1.0, (epoch + 1) / alignment_warmup_epochs)
+    else:
+        warmup_scale = 1.0
+    align_weight = alignment_loss_weight * warmup_scale
+    return recon_weight, align_weight
+
+
+def validate(models, dataloader, device, alignment_loss_fn, alignment_loss_weight, disentangling_loss_weight=0.0, use_curriculum=False, epoch=0, num_epochs=1, alignment_warmup_epochs: int=0, enable_modality_dropout: bool=False, p_drop_eda: float=0.0, p_drop_cheap: float=0.0, val_without_eda: bool=False, val_with_dropout: bool=False, mask_ratio: float=0.75):
     """Runs a validation loop and returns the average loss."""
     for model in models.values():
         model.eval()
     total_loss, total_recon_loss, total_align_loss, total_disent_loss = 0, 0, 0, 0
 
-    if use_curriculum:
-        ratio = (epoch + 1) / num_epochs
-        align_weight = np.sin(ratio * np.pi / 2)
-        recon_weight = np.cos(ratio * np.pi / 2)
-    else:
-        align_weight = alignment_loss_weight
-        recon_weight = 1.0
+    recon_weight, align_weight = compute_loss_weights(
+        epoch=epoch,
+        num_epochs=num_epochs,
+        use_curriculum=use_curriculum,
+        alignment_loss_weight=alignment_loss_weight,
+        alignment_warmup_epochs=alignment_warmup_epochs,
+    )
 
     with torch.no_grad():
         pbar_val = tqdm(dataloader, desc="Validating")
@@ -271,6 +308,13 @@ def train(args):
     if backbone_cls is None:
         raise ValueError(f"Unknown backbone '{args.backbone}'. Choose from: {list(BACKBONE_REGISTRY.keys())}")
     logging.info(f"Using backbone: {args.backbone} ({backbone_cls.__name__})")
+    resolve_loss_hyperparams(args)
+    logging.info(
+        "Loss weighting: alignment_loss_weight=%.4f, alignment_warmup_epochs=%d, use_curriculum=%s",
+        args.alignment_loss_weight,
+        args.alignment_warmup_epochs,
+        args.use_curriculum,
+    )
 
     models = {}
     for name in modality_names:
@@ -349,6 +393,19 @@ def train(args):
 
     for epoch in range(start_epoch, args.num_epochs):
         logging.info(f"--- Epoch {epoch+1}/{args.num_epochs} ---")
+        recon_weight, align_weight = compute_loss_weights(
+            epoch=epoch,
+            num_epochs=args.num_epochs,
+            use_curriculum=args.use_curriculum,
+            alignment_loss_weight=args.alignment_loss_weight,
+            alignment_warmup_epochs=args.alignment_warmup_epochs,
+        )
+        logging.info(
+            "Epoch %d loss weights | recon: %.4f align: %.4f",
+            epoch + 1,
+            recon_weight,
+            align_weight,
+        )
         
         # --- Training Loop ---
         for model in models.values():
@@ -426,13 +483,7 @@ def train(args):
             loss_disent = torch.stack(per_mod_disent).mean() if len(per_mod_disent) > 0 else torch.tensor(0.0, device=device)
 
             # Step 6: Combine losses
-            if args.use_curriculum:
-                ratio = (epoch + 1) / args.num_epochs
-                align_weight = np.sin(ratio * np.pi / 2)
-                recon_weight = np.cos(ratio * np.pi / 2)
-                loss = recon_weight * reconstruction_loss + align_weight * loss_align + args.disentangling_loss_weight * loss_disent
-            else:
-                loss = reconstruction_loss + args.alignment_loss_weight * loss_align + args.disentangling_loss_weight * loss_disent
+            loss = recon_weight * reconstruction_loss + align_weight * loss_align + args.disentangling_loss_weight * loss_disent
 
             loss.backward()
             active = set(signals.keys())
@@ -458,6 +509,7 @@ def train(args):
         # --- Validation Loop ---
         val_losses = validate(models, val_dataloader, device, alignment_loss_fn, args.alignment_loss_weight, args.disentangling_loss_weight,
                               use_curriculum=args.use_curriculum, epoch=epoch, num_epochs=args.num_epochs,
+                              alignment_warmup_epochs=args.alignment_warmup_epochs,
                               enable_modality_dropout=args.enable_modality_dropout,
                               p_drop_eda=args.p_drop_eda, p_drop_cheap=args.p_drop_cheap,
                               val_without_eda=args.val_without_eda, val_with_dropout=args.val_with_dropout,
@@ -473,6 +525,8 @@ def train(args):
         writer.add_scalar('Loss/val_recon', val_losses['recon'], epoch + 1)
         writer.add_scalar('Loss/val_align', val_losses['align'], epoch + 1)
         writer.add_scalar('Loss/val_disent', val_losses['disent'], epoch + 1)
+        writer.add_scalar('LossWeights/recon', recon_weight, epoch + 1)
+        writer.add_scalar('LossWeights/align', align_weight, epoch + 1)
 
         # --- Save Losses and Checkpoints ---
         current_lr = next(iter(schedulers.values())).get_last_lr()[0]
@@ -532,7 +586,8 @@ def main():
                         help='Encoder backbone architecture: transformer (default MAE), resnet1d, or tcn.')
     parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
     parser.add_argument('--dataset_percentage', type=float, default=1.0, help="Percentage of the dataset to use (0.0 to 1.0). Default: 1.0")
-    parser.add_argument('--alignment_loss_weight', type=float, default=1.0, help="Weight for the alignment loss component.")
+    parser.add_argument('--alignment_loss_weight', type=float, default=None, help="Weight for alignment loss. Default: 1.0 (transformer), 0.05 (resnet1d/tcn).")
+    parser.add_argument('--alignment_warmup_epochs', type=int, default=None, help="Linear warmup epochs for alignment weight. Default: 0 (transformer/curriculum), 10 (resnet1d/tcn).")
     parser.add_argument('--disentangling_loss_weight', type=float, default=0.0, help="Weight for the disentangling loss (cosine similarity between private and shared embeddings).")
     parser.add_argument('--device', type=str, default='cuda:15' if torch.cuda.is_available() else 'cpu', help="Specify the device (e.g., 'cuda:0', 'cuda:1', 'cpu')")
     
@@ -572,4 +627,4 @@ def main():
     train(args)
 
 if __name__ == '__main__':
-    main() 
+    main()

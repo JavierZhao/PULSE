@@ -11,6 +11,8 @@ import torch
 import torch.nn as nn
 import numpy as np
 from typing import Optional
+from timm.models.vision_transformer import Block
+from .model_utils.pos_embed import get_1d_sincos_pos_embed
 
 
 class CausalConv1d(nn.Module):
@@ -175,34 +177,65 @@ class TCNEncoder(nn.Module):
 
 
 class TCNDecoder(nn.Module):
-    """MLP-based decoder (matches ResNet1DDecoder)."""
+    """Transformer-style decoder for masked patch reconstruction."""
 
     def __init__(self, embed_dim: int = 1024, decoder_dim: int = 512,
                  num_patches: int = 40, window_len: int = 96,
-                 in_chans: int = 1, num_layers: int = 2):
+                 in_chans: int = 1, num_layers: int = 4,
+                 num_heads: int = 16, mlp_ratio: float = 4.0,
+                 norm_layer=nn.LayerNorm):
         super().__init__()
         self.num_patches = num_patches
-        self.decoder_embed = nn.Linear(embed_dim, decoder_dim)
+        self.decoder_embed = nn.Linear(embed_dim, decoder_dim, bias=True)
         self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_dim))
-        nn.init.normal_(self.mask_token, std=0.02)
+        self.decoder_pos_embed = nn.Parameter(
+            torch.zeros(1, num_patches + 1, decoder_dim), requires_grad=False
+        )
+        self.decoder_blocks = nn.ModuleList([
+            Block(decoder_dim, num_heads, mlp_ratio, qkv_bias=True, norm_layer=norm_layer)
+            for _ in range(num_layers)
+        ])
+        self.decoder_norm = norm_layer(decoder_dim)
+        self.decoder_pred = nn.Linear(decoder_dim, window_len * in_chans, bias=True)
 
-        layers = []
-        for _ in range(num_layers):
-            layers += [nn.Linear(decoder_dim, decoder_dim), nn.GELU()]
-        layers.append(nn.Linear(decoder_dim, window_len * in_chans))
-        self.mlp = nn.Sequential(*layers)
+        self.initialize_weights()
+
+    def initialize_weights(self):
+        decoder_pos_embed = get_1d_sincos_pos_embed(
+            self.decoder_pos_embed.shape[-1], self.num_patches, cls_token=True
+        )
+        self.decoder_pos_embed.data.copy_(torch.from_numpy(decoder_pos_embed).float().unsqueeze(0))
+        torch.nn.init.normal_(self.mask_token, std=0.02)
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.xavier_uniform_(module.weight)
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0)
+        elif isinstance(module, nn.LayerNorm):
+            nn.init.constant_(module.bias, 0)
+            nn.init.constant_(module.weight, 1.0)
 
     def forward(self, x: torch.Tensor, ids_restore: torch.Tensor):
         x = self.decoder_embed(x)
         mask_tokens = self.mask_token.repeat(
-            x.shape[0], ids_restore.shape[1] + 1 - x.shape[1], 1)
+            x.shape[0], ids_restore.shape[1] + 1 - x.shape[1], 1
+        )
         x_ = torch.cat([x[:, 1:, :], mask_tokens], dim=1)
         x_ = torch.gather(
             x_, dim=1,
-            index=ids_restore.unsqueeze(-1).expand(-1, -1, x.shape[2]))
+            index=ids_restore.unsqueeze(-1).expand(-1, -1, x.shape[2])
+        )
         x = torch.cat([x[:, :1, :], x_], dim=1)
+
+        x = x + self.decoder_pos_embed
+        for blk in self.decoder_blocks:
+            x = blk(x)
+        x = self.decoder_norm(x)
+        x = self.decoder_pred(x)
         x = x[:, 1:, :]
-        return self.mlp(x)
+        return x
 
 
 class TCNMAE(nn.Module):
@@ -244,6 +277,8 @@ class TCNMAE(nn.Module):
             embed_dim=embed_dim, decoder_dim=decoder_embed_dim,
             num_patches=self.num_patches, window_len=window_len,
             in_chans=in_chans, num_layers=decoder_depth,
+            num_heads=decoder_num_heads, mlp_ratio=decoder_mlp_ratio,
+            norm_layer=norm_layer,
         )
 
     # ------------------------------------------------------------------
