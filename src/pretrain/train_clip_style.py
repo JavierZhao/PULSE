@@ -1,8 +1,12 @@
 import argparse
+import logging
 import os
 import sys
 
+import numpy as np
+import pandas as pd
 import torch
+from tqdm import tqdm
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
@@ -15,22 +19,49 @@ from src.pretrain.baselines_common import (
     save_checkpoint,
     set_seed,
 )
+from src.utils import plot_single_loss_curve
 
 
 def evaluate(model, val_loader, device, temperature):
     model.eval()
     total = 0.0
     with torch.no_grad():
-        for batch in val_loader:
+        for batch in tqdm(val_loader, desc="Validating", leave=False):
             batch = move_batch(batch, device)
             loss = pairwise_clip_loss(model(batch), temperature)
             total += loss.item()
     return total / max(1, len(val_loader))
 
 
+def setup_logging(run_name: str, output_path: str) -> None:
+    """Configure file + console logging, matching the pretraining MAE script style."""
+    log_dir = os.path.join(output_path, run_name)
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, "train.log")
+
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    if logger.hasHandlers():
+        logger.handlers.clear()
+
+    formatter = logging.Formatter("%(asctime)s - %(levelname)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+
+    file_handler = logging.FileHandler(log_path)
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+
+
 def main(args):
     set_seed(args.seed)
     device = torch.device(args.device)
+    run_dir = os.path.join(args.output_path, args.run_name)
+    models_dir = os.path.join(run_dir, "models")
+    os.makedirs(models_dir, exist_ok=True)
+
     loaders = build_loaders(args.data_path, args.fold_number, args.batch_size, args.val_split, args.seed, args.num_workers)
 
     sample_batch = next(iter(loaders.train_loader))
@@ -39,28 +70,73 @@ def main(args):
     model = MultiModalProjector(signal_length, args.hidden_dim, args.proj_dim).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
 
-    run_dir = os.path.join(args.output_path, args.run_name)
-    os.makedirs(run_dir, exist_ok=True)
+    logging.info("--- Starting New Training Run ---")
+    logging.info(f"Run Name: {args.run_name}")
+    logging.info("Configuration:")
+    for key, value in vars(args).items():
+        logging.info(f"  {key}: {value}")
+    logging.info("\nModel Architecture:")
+    logging.info(str(model))
+    logging.info(f"Total parameters: {sum(p.numel() for p in model.parameters()):,}")
+    logging.info("-" * 50)
+    logging.info(f"Training set size: {len(loaders.train_loader.dataset)}")
+    logging.info(f"Validation set size: {len(loaders.val_loader.dataset)}")
+
     best_val = float('inf')
+    losses = []
 
     for epoch in range(1, args.num_epochs + 1):
+        logging.info(f"--- Epoch {epoch}/{args.num_epochs} ---")
         model.train()
         train_total = 0.0
-        for batch in loaders.train_loader:
+        pbar_train = tqdm(loaders.train_loader, desc=f"Training Epoch {epoch}")
+        for batch in pbar_train:
             batch = move_batch(batch, device)
             loss = pairwise_clip_loss(model(batch), args.temperature)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             train_total += loss.item()
+            pbar_train.set_postfix(Loss=f"{loss.item():.4f}")
 
         train_loss = train_total / max(1, len(loaders.train_loader))
         val_loss = evaluate(model, loaders.val_loader, device, args.temperature)
-        print(f"epoch={epoch} train={train_loss:.4f} val={val_loss:.4f}")
+        current_lr = optimizer.param_groups[0]["lr"]
+
+        losses.append({
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+            "lr": current_lr,
+        })
+        losses_df = pd.DataFrame(losses)
+        np.savez(
+            os.path.join(run_dir, "losses.npz"),
+            epoch=losses_df["epoch"].values,
+            train_loss=losses_df["train_loss"].values,
+            val_loss=losses_df["val_loss"].values,
+            lr=losses_df["lr"].values,
+        )
+
+        logging.info(
+            f"Epoch {epoch} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | LR: {current_lr:.2e}"
+        )
 
         if val_loss < best_val:
             best_val = val_loss
-            save_checkpoint(model, optimizer, epoch, os.path.join(run_dir, 'best_ckpt.pt'))
+            best_model_path = os.path.join(models_dir, "best_ckpt.pt")
+            save_checkpoint(model, optimizer, epoch, best_model_path)
+            logging.info(f"Saved best checkpoint to {best_model_path}")
+
+        if epoch % 5 == 0:
+            plot_path = os.path.join(run_dir, "loss_curves.png")
+            plot_single_loss_curve(losses_df, plot_path)
+            logging.info(f"Saved loss plot to {plot_path}")
+
+    logging.info("Training complete.")
+    final_plot_path = os.path.join(run_dir, "loss_curves.png")
+    plot_single_loss_curve(pd.DataFrame(losses), final_plot_path)
+    logging.info(f"Saved final loss plot to {final_plot_path}")
 
 
 if __name__ == '__main__':
@@ -80,4 +156,6 @@ if __name__ == '__main__':
     parser.add_argument('--val_split', type=float, default=0.1)
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--seed', type=int, default=42)
-    main(parser.parse_args())
+    args = parser.parse_args()
+    setup_logging(args.run_name, args.output_path)
+    main(args)
