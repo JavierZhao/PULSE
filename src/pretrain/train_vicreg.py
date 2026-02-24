@@ -68,6 +68,24 @@ def save_checkpoint(epoch, models, optimizers, schedulers, best_val_loss, losses
     logging.info(f"Checkpoint saved to {path}")
 
 
+def load_checkpoint(path, models, optimizers, schedulers, device):
+    if not os.path.isfile(path):
+        logging.warning(f"Checkpoint not found at {path}. Starting from scratch.")
+        return 0, float('inf'), []
+    checkpoint = torch.load(path, map_location=device)
+    for name, model in models.items():
+        model.load_state_dict(checkpoint[f'{name}_model_state_dict'])
+    for name, opt in optimizers.items():
+        opt.load_state_dict(checkpoint[f'{name}_optimizer_state_dict'])
+    for name, sch in schedulers.items():
+        sch.load_state_dict(checkpoint[f'{name}_scheduler_state_dict'])
+    epoch = checkpoint['epoch']
+    best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+    losses = checkpoint.get('losses', [])
+    logging.info(f"Resumed from epoch {epoch}. Best val loss: {best_val_loss:.4f}.")
+    return epoch, best_val_loss, losses
+
+
 def train(args):
     # Flash Attention 2 and Memory-Efficient Attention both require seqlen
     # alignment on RTX 3090/4090; the full unmasked sequence (40 patches +
@@ -128,15 +146,19 @@ def train(args):
     for k, v in vars(args).items():
         logging.info(f"  {k}: {v}")
 
+    start_epoch = 0
     best_val_loss = float('inf')
     all_losses = []
+    if args.resume_from:
+        start_epoch, best_val_loss, all_losses = load_checkpoint(
+            args.resume_from, models, optimizers, schedulers, device)
 
     # --- TensorBoard ---
     tb_dir = os.path.join(run_output_path, "tensorboard")
     writer = SummaryWriter(log_dir=tb_dir)
     logging.info(f"TensorBoard logs: {tb_dir}")
 
-    for epoch in range(args.num_epochs):
+    for epoch in range(start_epoch, args.num_epochs):
         logging.info(f"--- Epoch {epoch+1}/{args.num_epochs} ---")
 
         # --- Train ---
@@ -308,6 +330,8 @@ def main():
     parser.add_argument('--alignment_loss_weight', type=float, default=1.0)
     parser.add_argument('--hinge_alpha', type=float, default=0.2)
     parser.add_argument('--include_eda', action='store_true')
+    parser.add_argument('--resume_from', type=str, default=None,
+                        help='Path to checkpoint file to resume training from')
     args = parser.parse_args()
 
     setup_logging(args.run_name, args.output_path)
