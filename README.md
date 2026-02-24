@@ -122,6 +122,28 @@ python -m src.finetune.finetune \
 
 ---
 
+
+### Baseline SSL pretraining methods implemented for WESAD
+
+For quick baseline comparisons with PULSE-style objectives (ECG/BVP/ACC/TEMP), three pretraining scripts are included:
+
+1. **MultiMAE-style masked multimodal reconstruction**
+```bash
+python -m src.pretrain.train_multimae   --run_name multimae_wesad   --data_path ./preprocessed_data/60s_0.25s_sid   --fold_number 17   --device cuda:0
+```
+
+2. **CMSC-style cross-modal segment contrastive**
+```bash
+python -m src.pretrain.train_cmsc   --run_name cmsc_wesad   --data_path ./preprocessed_data/60s_0.25s_sid   --fold_number 17   --device cuda:0
+```
+
+3. **CLIP-style cross-modal contrastive**
+```bash
+python -m src.pretrain.train_clip_style   --run_name clip_wesad   --data_path ./preprocessed_data/60s_0.25s_sid   --fold_number 17   --device cuda:0
+```
+
+All scripts save the best checkpoint to `./results/pretrain_baselines/<run_name>/best_ckpt.pt` and support `--help` for full hyperparameters.
+
 ## 5) Finetuning (single fold)
 
 Minimal example (from scratch):

@@ -1,0 +1,94 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  labels:
+    jobgroup: pulse-pretrain
+  name: zz-pulse-clip-style
+spec:
+  parallelism: 1
+  backoffLimit: 1
+  template:
+    spec:
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          command:
+            - /bin/sh
+            - -c
+          args:
+            - |
+              git clone --single-branch --branch codex/pretrain-baseline-k8s-jobs https://github.com/JavierZhao/PULSE.git /opt/repo/PULSE && \
+              chown -R 1000:1000 /opt/repo/PULSE
+          volumeMounts:
+            - name: git-repo
+              mountPath: /opt/repo
+          resources:
+            limits:
+              cpu: "1"
+              memory: 1Gi
+            requests:
+              cpu: "1"
+              memory: 1Gi
+      containers:
+        - name: training
+          image: gitlab-registry.nrp-nautilus.io/jmduarte/hbb_interaction_network:latest
+          command:
+            - /bin/bash
+          args:
+            - -c
+            - |
+              pip install scikit-learn numpy matplotlib scipy pandas cvxopt tqdm seaborn timm && \
+              cd /opt/repo/PULSE && \
+              python -m src.pretrain.train_clip_style \
+                --run_name clip_wesad \
+                --data_path /j-jepa-vol/PULSE/preprocessed_data/60s_0.25s_sid \
+                --output_path /j-jepa-vol/PULSE/results/pretrain_baselines \
+                --fold_number 17 \
+                --num_epochs 100 \
+                --batch_size 128 \
+                --device cuda:0
+          resources:
+            limits:
+              cpu: "4"
+              memory: 26Gi
+              nvidia.com/gpu: 1
+            requests:
+              cpu: "4"
+              memory: 22Gi
+              nvidia.com/gpu: 1
+          volumeMounts:
+            - name: git-repo
+              mountPath: /opt/repo
+            - name: j-jepa-vol
+              mountPath: /j-jepa-vol
+            - name: dshm
+              mountPath: /dev/shm
+          ports:
+            - containerPort: 6006
+      volumes:
+        - name: git-repo
+          emptyDir: {}
+        - name: j-jepa-vol
+          persistentVolumeClaim:
+            claimName: j-jepa-vol
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 8Gi
+      restartPolicy: Never
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - gpn-fiona-mizzou-2.rnet.missouri.edu
+                      - rci-nrp-gpu-05.sdsu.edu
+                      - node-2-2.sdsc.optiputer.net
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      - NVIDIA-GeForce-RTX-3090
+                      - NVIDIA-GeForce-RTX-4090
