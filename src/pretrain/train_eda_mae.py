@@ -2,7 +2,6 @@ import argparse
 import os
 import sys
 import torch
-import torch.nn as nn
 from torch.utils.data import DataLoader, random_split
 from datetime import datetime
 import logging
@@ -13,7 +12,7 @@ import subprocess
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
-from src.model.CheapSensorMAE import CheapSensorMAE
+from src.model.backbone_registry import MAE_BACKBONE_REGISTRY
 from src.data.wesad_dataset import WESADDataset
 from src.utils import plot_single_loss_curve, plot_single_reconstruction
 
@@ -75,6 +74,43 @@ def validate(model, dataloader, device, mask_ratio):
             total_loss += loss.item()
     return total_loss / len(dataloader)
 
+
+def build_eda_teacher_model(args, device):
+    backbone_cls = MAE_BACKBONE_REGISTRY.get(args.backbone)
+    if backbone_cls is None:
+        raise ValueError(
+            f"Unknown backbone '{args.backbone}'. Choose from: {sorted(MAE_BACKBONE_REGISTRY.keys())}"
+        )
+
+    model_kwargs = {
+        'modality_name': 'eda',
+        'sig_len': args.signal_length,
+        'window_len': args.patch_window_len,
+        'embed_dim': args.embed_dim,
+        'depth': args.depth,
+        'num_heads': args.num_heads,
+        'decoder_embed_dim': args.decoder_embed_dim,
+        'decoder_depth': args.decoder_depth,
+        'decoder_num_heads': args.decoder_num_heads,
+        'mlp_ratio': args.mlp_ratio,
+        'decoder_mlp_ratio': args.decoder_mlp_ratio,
+        'private_mask_ratio': 1.0,
+    }
+    if args.backbone == 'resnet1d':
+        model_kwargs.update({
+            'base_channels': args.resnet_base_channels,
+            'num_blocks_per_stage': args.resnet_num_blocks_per_stage,
+            'kernel_size': args.resnet_kernel_size,
+        })
+    elif args.backbone == 'tcn':
+        model_kwargs.update({
+            'tcn_channels': args.tcn_channels,
+            'kernel_size': args.tcn_kernel_size,
+            'dropout': args.tcn_dropout,
+        })
+
+    return backbone_cls(**model_kwargs).to(device)
+
 def run_periodic_evaluation(run_output_path, models_path, args, epoch_plus_one):
     """Invoke evaluate_eda_mae.py to generate a reconstruction plot and rename it per-epoch."""
     ckpt_path = os.path.join(models_path, "best_ckpt.pt")
@@ -89,9 +125,30 @@ def run_periodic_evaluation(run_output_path, models_path, args, epoch_plus_one):
         '--output_path', run_output_path,
         '--fold_number', str(args.fold_number),
         '--device', args.device,
+        '--backbone', args.backbone,
         '--signal_length', str(args.signal_length),
         '--patch_window_len', str(args.patch_window_len),
+        '--embed_dim', str(args.embed_dim),
+        '--depth', str(args.depth),
+        '--num_heads', str(args.num_heads),
+        '--decoder_embed_dim', str(args.decoder_embed_dim),
+        '--decoder_depth', str(args.decoder_depth),
+        '--decoder_num_heads', str(args.decoder_num_heads),
+        '--mlp_ratio', str(args.mlp_ratio),
+        '--decoder_mlp_ratio', str(args.decoder_mlp_ratio),
     ]
+    if args.backbone == 'resnet1d':
+        cmd.extend([
+            '--resnet_base_channels', str(args.resnet_base_channels),
+            '--resnet_num_blocks_per_stage', str(args.resnet_num_blocks_per_stage),
+            '--resnet_kernel_size', str(args.resnet_kernel_size),
+        ])
+    elif args.backbone == 'tcn':
+        cmd.extend([
+            '--tcn_channels', str(args.tcn_channels),
+            '--tcn_kernel_size', str(args.tcn_kernel_size),
+            '--tcn_dropout', str(args.tcn_dropout),
+        ])
     try:
         logging.info(f"Running periodic evaluation at epoch {epoch_plus_one}...")
         subprocess.run(cmd, check=True)
@@ -119,12 +176,7 @@ def train(args):
     if not (0.0 <= args.mask_ratio <= 1.0):
         raise ValueError(f"mask_ratio must be in [0.0, 1.0], got {args.mask_ratio}")
     
-    model = CheapSensorMAE(
-        modality_name='eda',
-        sig_len=args.signal_length,
-        window_len=args.patch_window_len,
-        private_mask_ratio=1.0
-    ).to(device)
+    model = build_eda_teacher_model(args, device)
     
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs)
@@ -234,6 +286,8 @@ def main():
     parser.add_argument('--output_path', type=str, default="/j-jepa-vol/PULSE/results/eda_mae", help='Directory to save logs and models')
     parser.add_argument('--fold_number', type=int, default=17, help='The fold number to use for training/validation')
     parser.add_argument('--resume_from', type=str, default=None, help='Path to a checkpoint file to resume training from.')
+    parser.add_argument('--backbone', type=str, default='transformer', choices=sorted(MAE_BACKBONE_REGISTRY.keys()),
+                        help='EDA teacher MAE backbone: transformer, resnet1d, or tcn.')
     parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
     parser.add_argument('--dataset_percentage', type=float, default=1.0, help="Percentage of the dataset to use (0.0 to 1.0). Default: 1.0")
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu', help="Specify the device (e.g., 'cuda:0', 'cuda:1', 'cpu')")
@@ -241,6 +295,24 @@ def main():
     # Model specific arguments
     parser.add_argument('--signal_length', type=int, default=3840, help='Length of the input signal windows.')
     parser.add_argument('--patch_window_len', type=int, default=96, help='Length of the patch window for the MAE.')
+    parser.add_argument('--embed_dim', type=int, default=1024, help='Embedding dimension of the encoder.')
+    parser.add_argument('--depth', type=int, default=8, help='Depth of the encoder.')
+    parser.add_argument('--num_heads', type=int, default=8, help='Number of heads in the encoder.')
+    parser.add_argument('--decoder_embed_dim', type=int, default=512, help='Embedding dimension of the decoder.')
+    parser.add_argument('--decoder_depth', type=int, default=4, help='Depth of the decoder.')
+    parser.add_argument('--decoder_num_heads', type=int, default=16, help='Number of heads in the decoder.')
+    parser.add_argument('--mlp_ratio', type=float, default=4.0, help='MLP ratio for the encoder.')
+    parser.add_argument('--decoder_mlp_ratio', type=float, default=4.0, help='MLP ratio for the decoder.')
+
+    # ResNet1D-specific arguments
+    parser.add_argument('--resnet_base_channels', type=int, default=232, help='Base channels for ResNet1D encoder.')
+    parser.add_argument('--resnet_num_blocks_per_stage', type=int, default=2, help='Residual blocks per ResNet1D stage.')
+    parser.add_argument('--resnet_kernel_size', type=int, default=7, help='Kernel size for ResNet1D convolutions.')
+
+    # TCN-specific arguments
+    parser.add_argument('--tcn_channels', type=int, default=1520, help='Hidden channels for TCN encoder.')
+    parser.add_argument('--tcn_kernel_size', type=int, default=3, help='Kernel size for TCN convolutions.')
+    parser.add_argument('--tcn_dropout', type=float, default=0.1, help='Dropout rate for TCN blocks.')
     parser.add_argument('--mask_ratio', type=float, default=0.75, help='Fraction of patches to mask during MAE training/validation (0.0 to 1.0).')
 
     parser.add_argument('--batch_size', type=int, default=128, help='Batch size for training')
