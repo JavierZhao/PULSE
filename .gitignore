@@ -4,6 +4,10 @@ preprocessed_data/
 output/
 results/
 
+# Large artifacts
+*.npz
+*.zip
+
 # Python
 __pycache__/
 *.py[cod]
