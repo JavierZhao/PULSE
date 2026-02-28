@@ -391,12 +391,14 @@ def train(args, pretrained_run_name=None):
     full_train_dataset = WESADDataset(data_path=args.data_path, fold_number=args.fold_number, split='train', three_class=getattr(args, 'three_class', False))
 
     # Ensure the validation subject is not the same as the test subject
-    if args.val_subject_id == args.fold_number:
+    val_id = str(args.val_subject_id)
+    test_id = str(args.fold_number)
+    if val_id == test_id:
         raise ValueError("Validation subject ID cannot be the same as the test subject ID (fold_number).")
 
     # Split dataset into training and validation based on subject ID
-    val_indices = [i for i, sid in enumerate(full_train_dataset.S) if sid == args.val_subject_id]
-    train_indices = [i for i, sid in enumerate(full_train_dataset.S) if sid != args.val_subject_id]
+    val_indices = [i for i, sid in enumerate(full_train_dataset.S) if str(sid) == val_id]
+    train_indices = [i for i, sid in enumerate(full_train_dataset.S) if str(sid) != val_id]
     
     # Apply downsampling to the training set if a rate is specified
     if args.finetune_sample_rate > 1:
@@ -549,7 +551,7 @@ def main():
     parser.add_argument('--output_path', type=str, default="/j-jepa-vol/PULSE/results/finetuned_models", help='Directory to save logs and models')    
     # Data and training settings
     parser.add_argument('--fold_number', type=int, default=17, help='The fold number to use for training/validation (this is the test subject).')
-    parser.add_argument('--val_subject_id', type=int, default=16, help='The subject ID to use for the validation set.')
+    parser.add_argument('--val_subject_id', type=str, default=16, help='The subject ID to use for the validation set.')
     parser.add_argument('--finetune_sample_rate', type=int, default=1, help='Rate for downsampling the finetuning training data (1 in r samples).')
     parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
     parser.add_argument('--device', type=str, default='cuda:15' if torch.cuda.is_available() else 'cpu')
