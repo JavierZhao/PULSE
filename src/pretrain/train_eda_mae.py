@@ -197,6 +197,12 @@ def run_periodic_evaluation(run_output_path, models_path, args, epoch_plus_one):
 
 
 def train(args):
+    # Flash Attention 2 and Memory-Efficient Attention can trigger
+    # "CUDA error: invalid argument" on RTX 3090/4090 for this workload.
+    # Force the math backend for stability, matching other pretraining scripts.
+    torch.backends.cuda.enable_flash_sdp(False)
+    torch.backends.cuda.enable_mem_efficient_sdp(False)
+
     device = torch.device(args.device)
     run_output_path = os.path.join(args.output_path, args.run_name)
     models_path = os.path.join(run_output_path, "models")
