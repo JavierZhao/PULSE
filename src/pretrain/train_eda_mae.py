@@ -60,26 +60,33 @@ def load_checkpoint(path, model, optimizer, scheduler, device):
     logging.info(f"Resumed from epoch {epoch}. Best validation loss was {best_val_loss:.4f}.")
     return epoch, best_val_loss, losses
 
-def validate(model, dataloader, device, mask_ratio):
-    model.eval()
-    total_loss = 0
-    with torch.no_grad():
-        pbar_val = tqdm(dataloader, desc="Validating")
-        for batch in pbar_val:
-            sig = batch['eda'].to(device)
-            ids_shuffle, ids_restore, ids_keep = model.propose_masking(len(sig), model.num_patches, mask_ratio, device)
-            private, shared, mask = model.forward_encoder(sig, mask_ratio, ids_shuffle, ids_restore, ids_keep)
-            rec = model.forward_decoder(private, shared, ids_restore)
-            loss = model.reconstruction_loss(sig, rec, mask)
-            total_loss += loss.item()
-    return total_loss / len(dataloader)
+def resolve_teacher_setup(args):
+    aliases = {
+        'csms': 'cmsc',
+    }
+    teacher_for = aliases.get(args.teacher_for.lower(), args.teacher_for.lower())
+    supported_targets = {'mae', 'multimae', 'clip', 'cmsc', 'contrastive', 'vicreg', 'autoregressive'}
+    if teacher_for not in supported_targets:
+        raise ValueError(
+            f"Unknown teacher_for '{args.teacher_for}'. "
+            f"Choose from: ['mae', 'multimae', 'clip', 'cmsc', 'csms', 'contrastive', 'vicreg', 'autoregressive']"
+        )
+
+    backbone = args.backbone
+    if backbone not in MAE_BACKBONE_REGISTRY:
+        raise ValueError(
+            f"Masked-reconstruction teacher training requires a MAE backbone. "
+            f"Got backbone='{backbone}', choose from {sorted(MAE_BACKBONE_REGISTRY.keys())}"
+        )
+
+    return teacher_for, backbone
 
 
-def build_eda_teacher_model(args, device):
-    backbone_cls = MAE_BACKBONE_REGISTRY.get(args.backbone)
+def build_eda_teacher_model(args, device, backbone):
+    backbone_cls = MAE_BACKBONE_REGISTRY.get(backbone)
     if backbone_cls is None:
         raise ValueError(
-            f"Unknown backbone '{args.backbone}'. Choose from: {sorted(MAE_BACKBONE_REGISTRY.keys())}"
+            f"Unknown MAE backbone '{backbone}'. Choose from: {sorted(MAE_BACKBONE_REGISTRY.keys())}"
         )
 
     model_kwargs = {
@@ -96,13 +103,14 @@ def build_eda_teacher_model(args, device):
         'decoder_mlp_ratio': args.decoder_mlp_ratio,
         'private_mask_ratio': 1.0,
     }
-    if args.backbone == 'resnet1d':
+
+    if backbone == 'resnet1d':
         model_kwargs.update({
             'base_channels': args.resnet_base_channels,
             'num_blocks_per_stage': args.resnet_num_blocks_per_stage,
             'kernel_size': args.resnet_kernel_size,
         })
-    elif args.backbone == 'tcn':
+    elif backbone == 'tcn':
         model_kwargs.update({
             'tcn_channels': args.tcn_channels,
             'kernel_size': args.tcn_kernel_size,
@@ -110,6 +118,27 @@ def build_eda_teacher_model(args, device):
         })
 
     return backbone_cls(**model_kwargs).to(device)
+
+
+def compute_teacher_loss(model, sig, mask_ratio, device):
+    ids_shuffle, ids_restore, ids_keep = model.propose_masking(
+        len(sig), model.num_patches, mask_ratio, device
+    )
+    private, shared, mask = model.forward_encoder(sig, mask_ratio, ids_shuffle, ids_restore, ids_keep)
+    rec = model.forward_decoder(private, shared, ids_restore)
+    return model.reconstruction_loss(sig, rec, mask)
+
+
+def validate_teacher(model, dataloader, device, mask_ratio):
+    model.eval()
+    total_loss = 0.0
+    with torch.no_grad():
+        pbar_val = tqdm(dataloader, desc="Validating")
+        for batch in pbar_val:
+            sig = batch['eda'].to(device)
+            loss = compute_teacher_loss(model, sig, mask_ratio, device)
+            total_loss += loss.item()
+    return total_loss / len(dataloader)
 
 def run_periodic_evaluation(run_output_path, models_path, args, epoch_plus_one):
     """Invoke evaluate_eda_mae.py to generate a reconstruction plot and rename it per-epoch."""
@@ -172,11 +201,15 @@ def train(args):
     run_output_path = os.path.join(args.output_path, args.run_name)
     models_path = os.path.join(run_output_path, "models")
     os.makedirs(models_path, exist_ok=True)
-    
+
+    teacher_for, resolved_backbone = resolve_teacher_setup(args)
+    args.teacher_for = teacher_for
+    args.backbone = resolved_backbone
+
     if not (0.0 <= args.mask_ratio <= 1.0):
         raise ValueError(f"mask_ratio must be in [0.0, 1.0], got {args.mask_ratio}")
-    
-    model = build_eda_teacher_model(args, device)
+
+    model = build_eda_teacher_model(args, device, resolved_backbone)
     
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs)
@@ -190,6 +223,7 @@ def train(args):
         logging.info("Configuration:")
         for key, value in vars(args).items():
             logging.info(f"  {key}: {value}")
+        logging.info(f"  resolved_backbone: {resolved_backbone}")
         logging.info("\nModel Architecture:")
         logging.info(str(model))
         logging.info(f"Total parameters: {sum(p.numel() for p in model.parameters()):,}")
@@ -229,12 +263,8 @@ def train(args):
         for batch in pbar_train:
             sig = batch['eda'].to(device)
             optimizer.zero_grad()
-            
-            ids_shuffle, ids_restore, ids_keep = model.propose_masking(len(sig), model.num_patches, args.mask_ratio, device)
-            private, shared, mask = model.forward_encoder(sig, args.mask_ratio, ids_shuffle, ids_restore, ids_keep)
-            rec = model.forward_decoder(private, shared, ids_restore)
-            loss = model.reconstruction_loss(sig, rec, mask)
-            
+
+            loss = compute_teacher_loss(model, sig, args.mask_ratio, device)
             loss.backward()
             optimizer.step()
             
@@ -242,7 +272,7 @@ def train(args):
             pbar_train.set_postfix(Loss=loss.item())
 
         avg_train_loss = train_loss / len(train_dataloader)
-        avg_val_loss = validate(model, val_dataloader, device, args.mask_ratio)
+        avg_val_loss = validate_teacher(model, val_dataloader, device, args.mask_ratio)
         
         logging.info(f"Epoch {epoch+1} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
 
@@ -280,12 +310,15 @@ def train(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Train a Teacher MAE for EDA')
+    parser = argparse.ArgumentParser(description='Train an EDA teacher with masked reconstruction pretraining for KD.')
     parser.add_argument('--run_name', type=str, default=datetime.now().strftime("%Y%m%d_%H%M%S"))
     parser.add_argument('--data_path', type=str, default="/j-jepa-vol/PULSE/preprocessed_data/60s_0.25s_sid", help='Path to the WESAD preprocessed data directory')
     parser.add_argument('--output_path', type=str, default="/j-jepa-vol/PULSE/results/eda_mae", help='Directory to save logs and models')
     parser.add_argument('--fold_number', type=int, default=17, help='The fold number to use for training/validation')
     parser.add_argument('--resume_from', type=str, default=None, help='Path to a checkpoint file to resume training from.')
+    parser.add_argument('--teacher_for', type=str, default='mae',
+                        choices=['mae', 'multimae', 'clip', 'cmsc', 'csms', 'contrastive', 'vicreg', 'autoregressive'],
+                        help='Student pretraining family this teacher is intended for (metadata only). EDA teacher objective remains masked reconstruction.')
     parser.add_argument('--backbone', type=str, default='transformer', choices=sorted(MAE_BACKBONE_REGISTRY.keys()),
                         help='EDA teacher MAE backbone: transformer, resnet1d, or tcn.')
     parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
