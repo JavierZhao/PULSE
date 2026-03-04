@@ -79,9 +79,12 @@ class LegacyCMSCStudent(nn.Module):
         t1 = self._to_tokens(h1)
         t2 = self._to_tokens(h2)
 
+        # Legacy checkpoints expect out.1 input dim = hidden_dim * target_tokens.
+        # Pool first so flattened dim matches loaded linear weights.
+        h2_pooled = F.adaptive_avg_pool1d(h2, self.target_tokens)
         # Legacy "out" head gives one embedding vector; broadcast across tokens
         # so downstream KD code (token-level + pooled losses) can reuse it.
-        emb = self.out[3](self.out[2](self.out[1](self.out[0](h2))))
+        emb = self.out[3](self.out[2](self.out[1](self.out[0](h2_pooled))))
         t_emb = emb.unsqueeze(1).expand(-1, self.target_tokens, -1)
 
         shared = self._prepend_cls(t_emb)
@@ -118,4 +121,3 @@ class LegacyCMSCStudent(nn.Module):
 
     def reconstruction_loss(self, x, pred, mask):
         raise NotImplementedError("LegacyCMSCStudent has no reconstruction loss; use --recon_weight 0.0.")
-
