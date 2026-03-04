@@ -104,8 +104,9 @@ def _extract_student_state_dicts(checkpoint: Dict[str, object], modalities: List
     Supported layouts:
     1) students-only pretraining/KD ckpt: '<modality>_model_state_dict' keys at top level
     2) finetune classifier state_dict: flat keys like 'models.<modality>....'
-    3) wrapped model state_dict under 'model_state_dict' or 'state_dict'
-    4) single-backbone state_dict (replicated to all requested modalities)
+    3) legacy multimodal checkpoint: flat keys like 'encoders.<modality>....'
+    4) wrapped model state_dict under 'model_state_dict' or 'state_dict' or 'model'
+    5) single-backbone state_dict (replicated to all requested modalities)
     """
     resolved: Dict[str, Dict[str, torch.Tensor]] = {}
     source_notes: List[str] = []
@@ -123,7 +124,7 @@ def _extract_student_state_dicts(checkpoint: Dict[str, object], modalities: List
     candidates: List[Tuple[str, Dict[str, torch.Tensor]]] = []
     if isinstance(checkpoint, dict):
         candidates.append(("checkpoint", checkpoint))
-    for nested_key in ("model_state_dict", "state_dict", "student_state_dict"):
+    for nested_key in ("model_state_dict", "state_dict", "student_state_dict", "model"):
         nested = checkpoint.get(nested_key)
         if isinstance(nested, dict):
             candidates.append((nested_key, nested))
@@ -143,7 +144,22 @@ def _extract_student_state_dicts(checkpoint: Dict[str, object], modalities: List
         if used_label:
             source_notes.append(f"{label}: models.<modality>.*")
 
-    # 3) Single-backbone state_dict fallback (replicate to any missing modalities).
+    # 3) Legacy multimodal keys: 'encoders.<modality>.<...>'
+    for label, flat in candidates:
+        if not any(isinstance(k, str) and k.startswith("encoders.") for k in flat.keys()):
+            continue
+        used_label = False
+        for name in modalities:
+            if name in resolved:
+                continue
+            sub = _extract_prefixed_state(flat, f"encoders.{name}.")
+            if len(sub) > 0:
+                resolved[name] = sub
+                used_label = True
+        if used_label:
+            source_notes.append(f"{label}: encoders.<modality>.*")
+
+    # 4) Single-backbone state_dict fallback (replicate to any missing modalities).
     missing = [m for m in modalities if m not in resolved]
     if len(missing) > 0:
         for label, flat in candidates:
@@ -541,6 +557,16 @@ def train(args):
             if state is None:
                 logging.warning(f"Could not find weights for student modality '{name}' in {args.students_ckpt_path}.")
                 continue
+            model_keys = set(students[name].state_dict().keys())
+            state_keys = set(state.keys())
+            matched_keys = len(model_keys.intersection(state_keys))
+            if matched_keys == 0:
+                preview = ", ".join(list(state_keys)[:6]) + (" ..." if len(state_keys) > 6 else "")
+                logging.warning(
+                    f"Found state for student '{name}' but 0 keys match this backbone ({args.backbone}). "
+                    f"Checkpoint keys sample: {preview}"
+                )
+                continue
             try:
                 missing, unexpected = students[name].load_state_dict(state, strict=False)
             except RuntimeError as e:
@@ -549,20 +575,32 @@ def train(args):
             loaded_count += 1
             logging.info(
                 f"Loaded student {name} weights from {args.students_ckpt_path} "
-                f"(missing={len(missing)}, unexpected={len(unexpected)})"
+                f"(matched={matched_keys}, missing={len(missing)}, unexpected={len(unexpected)})"
             )
 
         if loaded_count == 0:
             if isinstance(ckpt, dict):
                 top_keys = list(ckpt.keys())
                 preview = ", ".join(top_keys[:8]) + (" ..." if len(top_keys) > 8 else "")
-                logging.warning(
+                msg = (
                     "No student weights were loaded from students checkpoint. "
-                    "Expected keys like '<modality>_model_state_dict' or 'models.<modality>.*'. "
+                    "Expected keys compatible with the selected backbone "
+                    f"('{args.backbone}') via '<modality>_model_state_dict', "
+                    "'models.<modality>.*', or 'encoders.<modality>.*'. "
                     f"Top-level keys: {preview}"
                 )
+                if 'model' in ckpt:
+                    msg += (
+                        ". This checkpoint includes a top-level 'model' entry, which is often a "
+                        "legacy baseline architecture and may be incompatible with current KD students."
+                    )
+                logging.error(msg)
             else:
-                logging.warning("No student weights were loaded: checkpoint is not a dict-like object.")
+                logging.error("No student weights were loaded: checkpoint is not a dict-like object.")
+            raise RuntimeError(
+                f"Student checkpoint load failed for {args.students_ckpt_path}. "
+                "Aborting to avoid training from random initialization."
+            )
     else:
         logging.warning("No valid students_ckpt_path provided. Students start from init.")
 
@@ -913,4 +951,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
