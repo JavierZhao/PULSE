@@ -175,6 +175,50 @@ def _extract_student_state_dicts(checkpoint: Dict[str, object], modalities: List
     return resolved, source
 
 
+def _is_legacy_cmsc_state_dict(state: Dict[str, torch.Tensor]) -> bool:
+    required = {"net.0.weight", "net.2.weight", "out.1.weight", "out.3.weight"}
+    if not isinstance(state, dict):
+        return False
+    return required.issubset(set(state.keys()))
+
+
+def _infer_legacy_cmsc_config(student_states: Dict[str, Dict[str, torch.Tensor]]) -> Dict[str, int]:
+    """
+    Infer legacy CMSC baseline encoder config from any available modality state.
+    Returns empty dict if the state does not look like that architecture.
+    """
+    for _, state in student_states.items():
+        if not _is_legacy_cmsc_state_dict(state):
+            continue
+
+        conv1_w = state["net.0.weight"]   # (C, 1, k1)
+        conv2_w = state["net.2.weight"]   # (C, C, k2)
+        out1_w = state["out.1.weight"]    # (D, C*T)
+        out3_w = state["out.3.weight"]    # (D, D)
+
+        hidden_dim = int(out3_w.shape[0])
+        conv_channels = int(conv1_w.shape[0])
+        flat_dim = int(out1_w.shape[1])
+        target_tokens = int(flat_dim // max(1, conv_channels))
+
+        if flat_dim % max(1, conv_channels) != 0:
+            logging.warning(
+                "Legacy CMSC checkpoint has non-divisible flatten dim (%d) / channels (%d). "
+                "Falling back to target_tokens=240.",
+                flat_dim,
+                conv_channels,
+            )
+            target_tokens = 240
+
+        return {
+            "hidden_dim": hidden_dim,
+            "conv1_kernel": int(conv1_w.shape[-1]),
+            "conv2_kernel": int(conv2_w.shape[-1]),
+            "target_tokens": max(1, target_tokens),
+        }
+    return {}
+
+
 def load_checkpoint(path, students, kd_heads, optimizer, scheduler, device):
     if not os.path.isfile(path):
         logging.warning(f"Checkpoint file not found at {path}. Starting from scratch.")
@@ -501,11 +545,39 @@ def train(args):
             raise ValueError("No valid student modalities specified. Provide at least one of {ecg,bvp,acc,temp}.")
         student_modalities = parsed
 
+    # Preload student checkpoint once so we can auto-detect legacy baseline format.
+    preloaded_student_ckpt = None
+    preloaded_student_states: Dict[str, Dict[str, torch.Tensor]] = {}
+    preloaded_student_source = "none"
+    legacy_cmsc_cfg: Dict[str, int] = {}
+    if args.students_ckpt_path is not None and os.path.isfile(args.students_ckpt_path):
+        preloaded_student_ckpt = torch.load(args.students_ckpt_path, map_location=device)
+        preloaded_student_states, preloaded_student_source = _extract_student_state_dicts(
+            preloaded_student_ckpt, student_modalities
+        )
+        legacy_cmsc_cfg = _infer_legacy_cmsc_config(preloaded_student_states)
+
     # Instantiate teacher and students
     teacher_backbone_cls = get_backbone_class(args.teacher_backbone)
-    student_backbone_cls = get_backbone_class(args.backbone)
+    resolved_student_backbone = args.backbone
+    if resolved_student_backbone != "legacy_cmsc" and len(legacy_cmsc_cfg) > 0:
+        logging.warning(
+            "Detected legacy CMSC student checkpoint format from %s (%s). "
+            "Overriding student backbone '%s' -> 'legacy_cmsc' to match checkpoint.",
+            args.students_ckpt_path,
+            preloaded_student_source,
+            args.backbone,
+        )
+        resolved_student_backbone = "legacy_cmsc"
+
+    if resolved_student_backbone == "legacy_cmsc":
+        from src.model.LegacyCMSCStudent import LegacyCMSCStudent
+        student_backbone_cls = LegacyCMSCStudent
+    else:
+        student_backbone_cls = get_backbone_class(resolved_student_backbone)
+
     logging.info(f"Teacher backbone: {args.teacher_backbone} ({teacher_backbone_cls.__name__})")
-    logging.info(f"Student backbone: {args.backbone} ({student_backbone_cls.__name__})")
+    logging.info(f"Student backbone: {resolved_student_backbone} ({student_backbone_cls.__name__})")
 
     teacher = teacher_backbone_cls(
         modality_name='eda',
@@ -518,20 +590,46 @@ def train(args):
     for p in teacher.parameters():
         p.requires_grad_(False)
 
-    students = {name: student_backbone_cls(
-        modality_name=name,
-        sig_len=args.signal_length,
-        window_len=args.patch_window_len,
-        embed_dim=args.embed_dim,
-        depth=args.depth,
-        num_heads=args.num_heads,
-        decoder_embed_dim=args.decoder_embed_dim,
-        decoder_depth=args.decoder_depth,
-        decoder_num_heads=args.decoder_num_heads,
-        mlp_ratio=args.mlp_ratio,
-        decoder_mlp_ratio=args.decoder_mlp_ratio,
-        private_mask_ratio=args.private_mask_ratio,
-    ).to(device) for name in student_modalities}
+    if resolved_student_backbone == "legacy_cmsc":
+        virtual_depth = max(1, args.depth)
+        if len(args.layers_to_match) > 0:
+            virtual_depth = max(virtual_depth, max(args.layers_to_match) + 1)
+
+        hidden_dim = int(legacy_cmsc_cfg.get("hidden_dim", 128))
+        conv1_kernel = int(legacy_cmsc_cfg.get("conv1_kernel", 7))
+        conv2_kernel = int(legacy_cmsc_cfg.get("conv2_kernel", 5))
+        target_tokens = int(legacy_cmsc_cfg.get("target_tokens", 240))
+
+        logging.info(
+            "Legacy CMSC student config: hidden_dim=%d, conv1_kernel=%d, conv2_kernel=%d, target_tokens=%d, virtual_depth=%d",
+            hidden_dim, conv1_kernel, conv2_kernel, target_tokens, virtual_depth
+        )
+
+        students = {name: student_backbone_cls(
+            modality_name=name,
+            sig_len=args.signal_length,
+            hidden_dim=hidden_dim,
+            conv1_kernel=conv1_kernel,
+            conv2_kernel=conv2_kernel,
+            target_tokens=target_tokens,
+            virtual_depth=virtual_depth,
+            private_mask_ratio=args.private_mask_ratio,
+        ).to(device) for name in student_modalities}
+    else:
+        students = {name: student_backbone_cls(
+            modality_name=name,
+            sig_len=args.signal_length,
+            window_len=args.patch_window_len,
+            embed_dim=args.embed_dim,
+            depth=args.depth,
+            num_heads=args.num_heads,
+            decoder_embed_dim=args.decoder_embed_dim,
+            decoder_depth=args.decoder_depth,
+            decoder_num_heads=args.decoder_num_heads,
+            mlp_ratio=args.mlp_ratio,
+            decoder_mlp_ratio=args.decoder_mlp_ratio,
+            private_mask_ratio=args.private_mask_ratio,
+        ).to(device) for name in student_modalities}
 
     # Load checkpoints
     if args.teacher_ckpt_path is not None and os.path.isfile(args.teacher_ckpt_path):
@@ -546,9 +644,12 @@ def train(args):
         logging.warning("No valid teacher_ckpt_path provided. Using randomly initialized teacher (frozen).")
 
     if args.students_ckpt_path is not None and os.path.isfile(args.students_ckpt_path):
-        ckpt = torch.load(args.students_ckpt_path, map_location=device)
+        ckpt = preloaded_student_ckpt if preloaded_student_ckpt is not None else torch.load(args.students_ckpt_path, map_location=device)
         modalities = list(students.keys())
-        student_states, source = _extract_student_state_dicts(ckpt, modalities)
+        if preloaded_student_ckpt is not None:
+            student_states, source = preloaded_student_states, preloaded_student_source
+        else:
+            student_states, source = _extract_student_state_dicts(ckpt, modalities)
         logging.info(f"Student checkpoint parse: {source}")
 
         loaded_count = 0
@@ -604,17 +705,27 @@ def train(args):
     else:
         logging.warning("No valid students_ckpt_path provided. Students start from init.")
 
+    if args.recon_weight > 0.0 and any(not getattr(model, "supports_reconstruction", True) for model in students.values()):
+        raise ValueError(
+            "recon_weight > 0 is not supported with legacy_cmsc student backbone "
+            "(no decoder/reconstruction head). Set --recon_weight 0.0."
+        )
+
     with torch.no_grad():
         dummy = torch.zeros(1, 1, args.signal_length, device=device)
         Ht_hidden, _, _ = get_hidden_and_final_tokens(teacher, dummy, mask_ratio=0.0, device=device)
+        any_student = next(iter(students.values()))
+        Hs_hidden_probe, _, _ = get_hidden_and_final_tokens(any_student, dummy, mask_ratio=0.0, device=device)
     teacher_dim = Ht_hidden[0].size(-1)
+    student_dim = Hs_hidden_probe[0].size(-1)
     # Resolve shared_dim to align with teacher when unset/non-positive
     resolved_shared_dim = args.shared_dim if getattr(args, 'shared_dim', -1) and args.shared_dim > 0 else int(teacher_dim)
+    logging.info(f"Resolved token dims -> student: {student_dim}, teacher: {teacher_dim}, shared: {resolved_shared_dim}")
 
     # KD heads
     # kd_heads = KDHeads(student_dim=args.embed_dim, teacher_dim=args.embed_dim, shared_dim=args.shared_dim, private_dim=args.private_dim, modalities=list(students.keys())).to(device)
     kd_heads = KDHeads(
-        student_dim=args.embed_dim,
+        student_dim=student_dim,
         teacher_dim=teacher_dim,
         shared_dim=resolved_shared_dim,
         private_dim=args.private_dim,
@@ -890,7 +1001,8 @@ def main():
     # Modalities selection (like pretrain/finetune)
     parser.add_argument('--modalities', type=str, default='all', help='Comma-separated list of student modalities from {ecg,bvp,acc,temp}, or "all"')
     # Backbone selection
-    parser.add_argument('--backbone', type=str, default='transformer', choices=sorted(BACKBONE_REGISTRY.keys()),
+    student_backbone_choices = sorted(BACKBONE_REGISTRY.keys()) + ['legacy_cmsc']
+    parser.add_argument('--backbone', type=str, default='transformer', choices=student_backbone_choices,
                         help='Encoder backbone architecture for student models.')
     parser.add_argument('--teacher_backbone', type=str, default='transformer', choices=sorted(BACKBONE_REGISTRY.keys()),
                         help='Encoder backbone architecture for the teacher model.')
