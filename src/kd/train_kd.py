@@ -4,6 +4,7 @@ import sys
 import math
 from datetime import datetime
 import logging
+from typing import Dict, List, Tuple
 
 import torch
 import torch.nn as nn
@@ -69,6 +70,93 @@ def save_students_only(students, path, extra_state=None):
         state.update(extra_state)
     torch.save(state, path)
     logging.info(f"Students-only checkpoint saved to {path}")
+
+
+def _extract_prefixed_state(flat_state: Dict[str, torch.Tensor], prefix: str) -> Dict[str, torch.Tensor]:
+    """Return a sub-state-dict with a prefix stripped from matching keys."""
+    out = {}
+    for k, v in flat_state.items():
+        if isinstance(k, str) and k.startswith(prefix):
+            out[k[len(prefix):]] = v
+    return out
+
+
+def _looks_like_backbone_state(flat_state: Dict[str, torch.Tensor]) -> bool:
+    """Heuristic for a single CheapSensorMAE backbone state_dict."""
+    if not isinstance(flat_state, dict) or len(flat_state) == 0:
+        return False
+    hints = (
+        "encoder.",
+        "decoder_",
+        "private_token",
+        "shared_token",
+        "mask_token",
+        "private_pos_embed",
+        "shared_pos_embed",
+    )
+    return any(isinstance(k, str) and k.startswith(hints) for k in flat_state.keys())
+
+
+def _extract_student_state_dicts(checkpoint: Dict[str, object], modalities: List[str]) -> Tuple[Dict[str, Dict[str, torch.Tensor]], str]:
+    """
+    Extract per-modality student state_dicts from different checkpoint layouts.
+
+    Supported layouts:
+    1) students-only pretraining/KD ckpt: '<modality>_model_state_dict' keys at top level
+    2) finetune classifier state_dict: flat keys like 'models.<modality>....'
+    3) wrapped model state_dict under 'model_state_dict' or 'state_dict'
+    4) single-backbone state_dict (replicated to all requested modalities)
+    """
+    resolved: Dict[str, Dict[str, torch.Tensor]] = {}
+    source_notes: List[str] = []
+
+    # 1) Top-level '<modality>_model_state_dict'
+    for name in modalities:
+        key = f"{name}_model_state_dict"
+        state = checkpoint.get(key)
+        if isinstance(state, dict):
+            resolved[name] = state
+    if len(resolved) > 0:
+        source_notes.append("top-level <modality>_model_state_dict")
+
+    # Build candidate flat state_dict containers to inspect.
+    candidates: List[Tuple[str, Dict[str, torch.Tensor]]] = []
+    if isinstance(checkpoint, dict):
+        candidates.append(("checkpoint", checkpoint))
+    for nested_key in ("model_state_dict", "state_dict", "student_state_dict"):
+        nested = checkpoint.get(nested_key)
+        if isinstance(nested, dict):
+            candidates.append((nested_key, nested))
+
+    # 2) Finetune-style keys: 'models.<modality>.<...>'
+    for label, flat in candidates:
+        if not any(isinstance(k, str) and k.startswith("models.") for k in flat.keys()):
+            continue
+        used_label = False
+        for name in modalities:
+            if name in resolved:
+                continue
+            sub = _extract_prefixed_state(flat, f"models.{name}.")
+            if len(sub) > 0:
+                resolved[name] = sub
+                used_label = True
+        if used_label:
+            source_notes.append(f"{label}: models.<modality>.*")
+
+    # 3) Single-backbone state_dict fallback (replicate to any missing modalities).
+    missing = [m for m in modalities if m not in resolved]
+    if len(missing) > 0:
+        for label, flat in candidates:
+            if any(isinstance(k, str) and k.startswith("models.") for k in flat.keys()):
+                continue
+            if _looks_like_backbone_state(flat):
+                for name in missing:
+                    resolved[name] = flat
+                source_notes.append(f"{label}: single-backbone state_dict (replicated)")
+                break
+
+    source = "; ".join(source_notes) if len(source_notes) > 0 else "unrecognized checkpoint format"
+    return resolved, source
 
 
 def load_checkpoint(path, students, kd_heads, optimizer, scheduler, device):
@@ -443,13 +531,38 @@ def train(args):
 
     if args.students_ckpt_path is not None and os.path.isfile(args.students_ckpt_path):
         ckpt = torch.load(args.students_ckpt_path, map_location=device)
-        for name in students.keys():
-            key = f'{name}_model_state_dict'
-            if key in ckpt:
-                students[name].load_state_dict(ckpt[key], strict=False)
-                logging.info(f"Loaded student {name} weights from {args.students_ckpt_path}")
+        modalities = list(students.keys())
+        student_states, source = _extract_student_state_dicts(ckpt, modalities)
+        logging.info(f"Student checkpoint parse: {source}")
+
+        loaded_count = 0
+        for name in modalities:
+            state = student_states.get(name)
+            if state is None:
+                logging.warning(f"Could not find weights for student modality '{name}' in {args.students_ckpt_path}.")
+                continue
+            try:
+                missing, unexpected = students[name].load_state_dict(state, strict=False)
+            except RuntimeError as e:
+                logging.warning(f"Failed to load student '{name}' from {args.students_ckpt_path}: {e}")
+                continue
+            loaded_count += 1
+            logging.info(
+                f"Loaded student {name} weights from {args.students_ckpt_path} "
+                f"(missing={len(missing)}, unexpected={len(unexpected)})"
+            )
+
+        if loaded_count == 0:
+            if isinstance(ckpt, dict):
+                top_keys = list(ckpt.keys())
+                preview = ", ".join(top_keys[:8]) + (" ..." if len(top_keys) > 8 else "")
+                logging.warning(
+                    "No student weights were loaded from students checkpoint. "
+                    "Expected keys like '<modality>_model_state_dict' or 'models.<modality>.*'. "
+                    f"Top-level keys: {preview}"
+                )
             else:
-                logging.warning(f"Key {key} not found in students checkpoint.")
+                logging.warning("No student weights were loaded: checkpoint is not a dict-like object.")
     else:
         logging.warning("No valid students_ckpt_path provided. Students start from init.")
 
@@ -800,5 +913,4 @@ def main():
 
 if __name__ == '__main__':
     main()
-
 
