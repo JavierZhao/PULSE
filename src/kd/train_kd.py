@@ -219,6 +219,50 @@ def _infer_legacy_cmsc_config(student_states: Dict[str, Dict[str, torch.Tensor]]
     return {}
 
 
+def _is_legacy_multimae_state_dict(state: Dict[str, torch.Tensor]) -> bool:
+    required = {"0.weight", "2.weight", "6.weight"}
+    if not isinstance(state, dict):
+        return False
+    return required.issubset(set(state.keys()))
+
+
+def _infer_legacy_multimae_config(student_states: Dict[str, Dict[str, torch.Tensor]]) -> Dict[str, int]:
+    """
+    Infer legacy MultiMAE baseline encoder config from any available modality state.
+    Returns empty dict if the state does not look like that architecture.
+    """
+    for _, state in student_states.items():
+        if not _is_legacy_multimae_state_dict(state):
+            continue
+
+        conv1_w = state["0.weight"]  # (C, 1, k1)
+        conv2_w = state["2.weight"]  # (C, C, k2)
+        proj_w = state["6.weight"]   # (D, C*T)
+
+        hidden_dim = int(conv1_w.shape[0])
+        latent_dim = int(proj_w.shape[0])
+        flat_dim = int(proj_w.shape[1])
+        target_tokens = int(flat_dim // max(1, hidden_dim))
+
+        if flat_dim % max(1, hidden_dim) != 0:
+            logging.warning(
+                "Legacy MultiMAE checkpoint has non-divisible flatten dim (%d) / channels (%d). "
+                "Falling back to target_tokens=480.",
+                flat_dim,
+                hidden_dim,
+            )
+            target_tokens = 480
+
+        return {
+            "hidden_dim": hidden_dim,
+            "latent_dim": latent_dim,
+            "conv1_kernel": int(conv1_w.shape[-1]),
+            "conv2_kernel": int(conv2_w.shape[-1]),
+            "target_tokens": max(1, target_tokens),
+        }
+    return {}
+
+
 def load_checkpoint(path, students, kd_heads, optimizer, scheduler, device):
     if not os.path.isfile(path):
         logging.warning(f"Checkpoint file not found at {path}. Starting from scratch.")
@@ -550,29 +594,44 @@ def train(args):
     preloaded_student_states: Dict[str, Dict[str, torch.Tensor]] = {}
     preloaded_student_source = "none"
     legacy_cmsc_cfg: Dict[str, int] = {}
+    legacy_multimae_cfg: Dict[str, int] = {}
     if args.students_ckpt_path is not None and os.path.isfile(args.students_ckpt_path):
         preloaded_student_ckpt = torch.load(args.students_ckpt_path, map_location=device)
         preloaded_student_states, preloaded_student_source = _extract_student_state_dicts(
             preloaded_student_ckpt, student_modalities
         )
         legacy_cmsc_cfg = _infer_legacy_cmsc_config(preloaded_student_states)
+        legacy_multimae_cfg = _infer_legacy_multimae_config(preloaded_student_states)
 
     # Instantiate teacher and students
     teacher_backbone_cls = get_backbone_class(args.teacher_backbone)
     resolved_student_backbone = args.backbone
-    if resolved_student_backbone != "legacy_cmsc" and len(legacy_cmsc_cfg) > 0:
-        logging.warning(
-            "Detected legacy CMSC student checkpoint format from %s (%s). "
-            "Overriding student backbone '%s' -> 'legacy_cmsc' to match checkpoint.",
-            args.students_ckpt_path,
-            preloaded_student_source,
-            args.backbone,
-        )
-        resolved_student_backbone = "legacy_cmsc"
+    if resolved_student_backbone not in {"legacy_cmsc", "legacy_multimae"}:
+        if len(legacy_cmsc_cfg) > 0:
+            logging.warning(
+                "Detected legacy CMSC student checkpoint format from %s (%s). "
+                "Overriding student backbone '%s' -> 'legacy_cmsc' to match checkpoint.",
+                args.students_ckpt_path,
+                preloaded_student_source,
+                args.backbone,
+            )
+            resolved_student_backbone = "legacy_cmsc"
+        elif len(legacy_multimae_cfg) > 0:
+            logging.warning(
+                "Detected legacy MultiMAE student checkpoint format from %s (%s). "
+                "Overriding student backbone '%s' -> 'legacy_multimae' to match checkpoint.",
+                args.students_ckpt_path,
+                preloaded_student_source,
+                args.backbone,
+            )
+            resolved_student_backbone = "legacy_multimae"
 
     if resolved_student_backbone == "legacy_cmsc":
         from src.model.LegacyCMSCStudent import LegacyCMSCStudent
         student_backbone_cls = LegacyCMSCStudent
+    elif resolved_student_backbone == "legacy_multimae":
+        from src.model.LegacyMultiMAEStudent import LegacyMultiMAEStudent
+        student_backbone_cls = LegacyMultiMAEStudent
     else:
         student_backbone_cls = get_backbone_class(resolved_student_backbone)
 
@@ -609,6 +668,33 @@ def train(args):
             modality_name=name,
             sig_len=args.signal_length,
             hidden_dim=hidden_dim,
+            conv1_kernel=conv1_kernel,
+            conv2_kernel=conv2_kernel,
+            target_tokens=target_tokens,
+            virtual_depth=virtual_depth,
+            private_mask_ratio=args.private_mask_ratio,
+        ).to(device) for name in student_modalities}
+    elif resolved_student_backbone == "legacy_multimae":
+        virtual_depth = max(1, args.depth)
+        if len(args.layers_to_match) > 0:
+            virtual_depth = max(virtual_depth, max(args.layers_to_match) + 1)
+
+        hidden_dim = int(legacy_multimae_cfg.get("hidden_dim", 128))
+        latent_dim = int(legacy_multimae_cfg.get("latent_dim", hidden_dim))
+        conv1_kernel = int(legacy_multimae_cfg.get("conv1_kernel", 7))
+        conv2_kernel = int(legacy_multimae_cfg.get("conv2_kernel", 5))
+        target_tokens = int(legacy_multimae_cfg.get("target_tokens", 480))
+
+        logging.info(
+            "Legacy MultiMAE student config: hidden_dim=%d, latent_dim=%d, conv1_kernel=%d, conv2_kernel=%d, target_tokens=%d, virtual_depth=%d",
+            hidden_dim, latent_dim, conv1_kernel, conv2_kernel, target_tokens, virtual_depth
+        )
+
+        students = {name: student_backbone_cls(
+            modality_name=name,
+            sig_len=args.signal_length,
+            hidden_dim=hidden_dim,
+            latent_dim=latent_dim,
             conv1_kernel=conv1_kernel,
             conv2_kernel=conv2_kernel,
             target_tokens=target_tokens,
@@ -664,7 +750,7 @@ def train(args):
             if matched_keys == 0:
                 preview = ", ".join(list(state_keys)[:6]) + (" ..." if len(state_keys) > 6 else "")
                 logging.warning(
-                    f"Found state for student '{name}' but 0 keys match this backbone ({args.backbone}). "
+                    f"Found state for student '{name}' but 0 keys match this backbone ({resolved_student_backbone}). "
                     f"Checkpoint keys sample: {preview}"
                 )
                 continue
@@ -686,7 +772,7 @@ def train(args):
                 msg = (
                     "No student weights were loaded from students checkpoint. "
                     "Expected keys compatible with the selected backbone "
-                    f"('{args.backbone}') via '<modality>_model_state_dict', "
+                    f"('{resolved_student_backbone}') via '<modality>_model_state_dict', "
                     "'models.<modality>.*', or 'encoders.<modality>.*'. "
                     f"Top-level keys: {preview}"
                 )
@@ -1001,7 +1087,7 @@ def main():
     # Modalities selection (like pretrain/finetune)
     parser.add_argument('--modalities', type=str, default='all', help='Comma-separated list of student modalities from {ecg,bvp,acc,temp}, or "all"')
     # Backbone selection
-    student_backbone_choices = sorted(BACKBONE_REGISTRY.keys()) + ['legacy_cmsc']
+    student_backbone_choices = sorted(BACKBONE_REGISTRY.keys()) + ['legacy_cmsc', 'legacy_multimae']
     parser.add_argument('--backbone', type=str, default='transformer', choices=student_backbone_choices,
                         help='Encoder backbone architecture for student models.')
     parser.add_argument('--teacher_backbone', type=str, default='transformer', choices=sorted(BACKBONE_REGISTRY.keys()),
