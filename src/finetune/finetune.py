@@ -10,12 +10,187 @@ from tqdm import tqdm
 import pandas as pd
 import numpy as np
 from sklearn.metrics import f1_score, accuracy_score, roc_auc_score, average_precision_score, precision_recall_curve
+from typing import Any, Dict, List, Optional, Tuple
 
 # Add the project root to the Python path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
 from src.model.backbone_registry import BACKBONE_REGISTRY, get_backbone_class
 from src.data.wesad_dataset import WESADDataset
+
+
+FINETUNE_BACKBONE_CHOICES = sorted(BACKBONE_REGISTRY.keys()) + ['legacy_cmsc', 'legacy_multimae']
+
+
+def get_finetune_backbone_class(name: str):
+    if name == 'legacy_cmsc':
+        from src.model.LegacyCMSCStudent import LegacyCMSCStudent
+        return LegacyCMSCStudent
+    if name == 'legacy_multimae':
+        from src.model.LegacyMultiMAEStudent import LegacyMultiMAEStudent
+        return LegacyMultiMAEStudent
+    return get_backbone_class(name)
+
+
+def _extract_prefixed_state(flat_state: Dict[str, Any], prefix: str) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for key, value in flat_state.items():
+        if isinstance(key, str) and key.startswith(prefix):
+            out[key[len(prefix):]] = value
+    return out
+
+
+def _extract_checkpoint_model_states(checkpoint: Dict[str, Any], modalities: List[str]) -> Dict[str, Dict[str, Any]]:
+    resolved: Dict[str, Dict[str, Any]] = {}
+    if not isinstance(checkpoint, dict):
+        return resolved
+
+    for name in modalities:
+        state = checkpoint.get(f'{name}_model_state_dict')
+        if isinstance(state, dict):
+            resolved[name] = state
+
+    for name in modalities:
+        if name in resolved:
+            continue
+        sub = _extract_prefixed_state(checkpoint, f'models.{name}.')
+        if len(sub) > 0:
+            resolved[name] = sub
+
+    return resolved
+
+
+def _is_legacy_cmsc_state_dict(state: Dict[str, Any]) -> bool:
+    required = {"net.0.weight", "net.2.weight", "out.1.weight", "out.3.weight"}
+    return isinstance(state, dict) and required.issubset(set(state.keys()))
+
+
+def _infer_legacy_cmsc_config(student_states: Dict[str, Dict[str, Any]]) -> Dict[str, int]:
+    for state in student_states.values():
+        if not _is_legacy_cmsc_state_dict(state):
+            continue
+
+        conv1_w = state["net.0.weight"]
+        conv2_w = state["net.2.weight"]
+        out1_w = state["out.1.weight"]
+        out3_w = state["out.3.weight"]
+
+        hidden_dim = int(out3_w.shape[0])
+        conv_channels = int(conv1_w.shape[0])
+        flat_dim = int(out1_w.shape[1])
+        target_tokens = int(flat_dim // max(1, conv_channels))
+        if flat_dim % max(1, conv_channels) != 0:
+            target_tokens = 240
+
+        return {
+            "hidden_dim": hidden_dim,
+            "conv1_kernel": int(conv1_w.shape[-1]),
+            "conv2_kernel": int(conv2_w.shape[-1]),
+            "target_tokens": max(1, target_tokens),
+        }
+    return {}
+
+
+def _is_legacy_multimae_state_dict(state: Dict[str, Any]) -> bool:
+    required = {"0.weight", "2.weight", "6.weight"}
+    return isinstance(state, dict) and required.issubset(set(state.keys()))
+
+
+def _infer_legacy_multimae_config(student_states: Dict[str, Dict[str, Any]]) -> Dict[str, int]:
+    for state in student_states.values():
+        if not _is_legacy_multimae_state_dict(state):
+            continue
+
+        conv1_w = state["0.weight"]
+        conv2_w = state["2.weight"]
+        proj_w = state["6.weight"]
+
+        hidden_dim = int(conv1_w.shape[0])
+        latent_dim = int(proj_w.shape[0])
+        flat_dim = int(proj_w.shape[1])
+        target_tokens = int(flat_dim // max(1, hidden_dim))
+        if flat_dim % max(1, hidden_dim) != 0:
+            target_tokens = 480
+
+        return {
+            "hidden_dim": hidden_dim,
+            "latent_dim": latent_dim,
+            "conv1_kernel": int(conv1_w.shape[-1]),
+            "conv2_kernel": int(conv2_w.shape[-1]),
+            "target_tokens": max(1, target_tokens),
+        }
+    return {}
+
+
+def resolve_model_args_for_backbone(
+    backbone: str,
+    base_model_args: Dict[str, Any],
+    legacy_cfg: Optional[Dict[str, int]] = None,
+) -> Tuple[Dict[str, Any], int]:
+    legacy_cfg = legacy_cfg or {}
+    sig_len = int(base_model_args.get('sig_len', 3840))
+    depth = int(base_model_args.get('depth', 8))
+    private_mask_ratio = float(base_model_args.get('private_mask_ratio', 0.5))
+    embed_dim = int(base_model_args.get('embed_dim', 1024))
+
+    if backbone == 'legacy_cmsc':
+        hidden_dim = int(legacy_cfg.get('hidden_dim', embed_dim))
+        return {
+            'sig_len': sig_len,
+            'hidden_dim': hidden_dim,
+            'conv1_kernel': int(legacy_cfg.get('conv1_kernel', 7)),
+            'conv2_kernel': int(legacy_cfg.get('conv2_kernel', 5)),
+            'target_tokens': int(legacy_cfg.get('target_tokens', 240)),
+            'virtual_depth': depth,
+            'private_mask_ratio': private_mask_ratio,
+        }, hidden_dim
+
+    if backbone == 'legacy_multimae':
+        hidden_dim = int(legacy_cfg.get('hidden_dim', embed_dim))
+        return {
+            'sig_len': sig_len,
+            'hidden_dim': hidden_dim,
+            'latent_dim': int(legacy_cfg.get('latent_dim', hidden_dim)),
+            'conv1_kernel': int(legacy_cfg.get('conv1_kernel', 7)),
+            'conv2_kernel': int(legacy_cfg.get('conv2_kernel', 5)),
+            'target_tokens': int(legacy_cfg.get('target_tokens', max(1, sig_len // 8))),
+            'virtual_depth': depth,
+            'private_mask_ratio': private_mask_ratio,
+        }, hidden_dim
+
+    return dict(base_model_args), embed_dim
+
+
+def resolve_finetune_backbone_from_checkpoint(
+    checkpoint: Dict[str, Any],
+    modalities: List[str],
+    requested_backbone: str,
+    base_model_args: Dict[str, Any],
+) -> Tuple[str, Dict[str, Any], int, str]:
+    student_states = _extract_checkpoint_model_states(checkpoint, modalities)
+    legacy_cmsc_cfg = _infer_legacy_cmsc_config(student_states)
+    legacy_multimae_cfg = _infer_legacy_multimae_config(student_states)
+
+    resolved_backbone = requested_backbone
+    source = "cli"
+    if requested_backbone not in {'legacy_cmsc', 'legacy_multimae'}:
+        if len(legacy_cmsc_cfg) > 0:
+            resolved_backbone = 'legacy_cmsc'
+            source = 'legacy_cmsc checkpoint auto-detect'
+        elif len(legacy_multimae_cfg) > 0:
+            resolved_backbone = 'legacy_multimae'
+            source = 'legacy_multimae checkpoint auto-detect'
+
+    legacy_cfg = {}
+    if resolved_backbone == 'legacy_cmsc':
+        legacy_cfg = legacy_cmsc_cfg
+    elif resolved_backbone == 'legacy_multimae':
+        legacy_cfg = legacy_multimae_cfg
+
+    resolved_model_args, feature_dim = resolve_model_args_for_backbone(
+        resolved_backbone, base_model_args, legacy_cfg
+    )
+    return resolved_backbone, resolved_model_args, feature_dim, source
 
 class StressClassifier(nn.Module):
     def __init__(self, models, embed_dim, freeze_backbone=False, linear_classifier=False, only_shared=False, fuse_embeddings=False, modalities=None, num_classes=1, adaptive_fusion=False):
@@ -149,11 +324,10 @@ def setup_logging(run_name, output_path):
     logger.addHandler(console_handler)
 
 
-def load_pretrained_models(path, device, model_args, modalities=None, backbone='transformer'):
+def load_pretrained_models(path, device, model_args, modalities=None, backbone='transformer', checkpoint=None):
     """Loads the pretrained models from a checkpoint file."""
-    backbone_cls = get_backbone_class(backbone)
-
-    checkpoint = torch.load(path, map_location=device)
+    backbone_cls = get_finetune_backbone_class(backbone)
+    checkpoint = checkpoint if checkpoint is not None else torch.load(path, map_location=device)
 
     selected = modalities if modalities is not None else ['ecg', 'bvp', 'acc', 'temp']
     models = {}
@@ -315,15 +489,7 @@ def train(args, pretrained_run_name=None):
         if getattr(args, 'include_eda', False) and 'eda' not in modalities:
             modalities.append('eda')
     
-    # --- Log arguments ---
-    logging.info("--- Command Line Arguments ---")
-    for arg, value in sorted(vars(args).items()):
-        logging.info(f"{arg}: {value}")
-    logging.info("------------------------------")
-    logging.info(f"Using modalities: {modalities}")
-    
-    # --- Load Pretrained Models ---
-    model_args = {
+    base_model_args = {
         'sig_len': args.signal_length, 'window_len': args.patch_window_len, 
         'private_mask_ratio': args.private_mask_ratio, 'embed_dim': args.embed_dim, 
         'depth': args.depth, 'num_heads': args.num_heads,
@@ -331,23 +497,15 @@ def train(args, pretrained_run_name=None):
         'decoder_num_heads': args.decoder_num_heads, 'mlp_ratio': args.mlp_ratio, 
         'decoder_mlp_ratio': args.decoder_mlp_ratio
     }
-    
-    backbone_cls = get_backbone_class(args.backbone)
-    logging.info(f"Using backbone: {args.backbone} ({backbone_cls.__name__})")
+    requested_backbone = args.backbone
+    resolved_backbone = args.backbone
+    resolved_model_args, resolved_embed_dim = resolve_model_args_for_backbone(args.backbone, base_model_args)
+    ckpt_path = None
+    preloaded_checkpoint = None
+    backbone_source = "cli"
 
-    if args.from_scratch:
-        logging.info("--- Training from Scratch ---")
-        base_models = {
-            name: backbone_cls(modality_name=name, **model_args).to(device)
-            for name in modalities
-        }
-    else:
-        logging.info("--- Loading Pretrained Models for Fine-tuning ---")
-        # Interpret run_name as either a bare name (legacy) or an absolute/relative path to a models directory
-        # If it points to a directory, look for best_ckpt.pt inside; if it points to a file, use it directly
+    if not args.from_scratch:
         candidate = pretrained_run_name if pretrained_run_name else args.run_name
-        print("path candidate", candidate)
-        ckpt_path = candidate
         if os.path.isfile(candidate):
             ckpt_path = candidate
         elif os.path.isdir(candidate):
@@ -355,14 +513,58 @@ def train(args, pretrained_run_name=None):
             if os.path.isfile(file_candidate):
                 ckpt_path = file_candidate
         else:
-            # Legacy behavior: assume a run name under results/cheap_maes/<name>/models/best_ckpt.pt
             legacy = os.path.join('/j-jepa-vol/PULSE/results/cheap_maes', candidate, 'models', 'best_ckpt.pt')
             if os.path.isfile(legacy):
                 ckpt_path = legacy
+
         if ckpt_path is None:
-            raise FileNotFoundError(f"Could not resolve pretrained checkpoint from run_name='{args.run_name}'. Provide a full path to a file or models dir, or ensure legacy path exists.")
+            raise FileNotFoundError(
+                f"Could not resolve pretrained checkpoint from run_name='{args.run_name}'. "
+                "Provide a full path to a file or models dir, or ensure legacy path exists."
+            )
+
+        preloaded_checkpoint = torch.load(ckpt_path, map_location=device)
+        resolved_backbone, resolved_model_args, resolved_embed_dim, backbone_source = resolve_finetune_backbone_from_checkpoint(
+            preloaded_checkpoint, modalities, requested_backbone, base_model_args
+        )
         args.pretrained_ckpt_path = ckpt_path
-        base_models = load_pretrained_models(ckpt_path, device, model_args, modalities, backbone=args.backbone)
+
+    args.backbone = resolved_backbone
+    args.embed_dim = resolved_embed_dim
+
+    # --- Log arguments ---
+    logging.info("--- Command Line Arguments ---")
+    for arg, value in sorted(vars(args).items()):
+        logging.info(f"{arg}: {value}")
+    logging.info("------------------------------")
+    logging.info(f"Using modalities: {modalities}")
+    logging.info(f"Resolved finetune backbone: {resolved_backbone} (source={backbone_source})")
+
+    backbone_cls = get_finetune_backbone_class(resolved_backbone)
+    logging.info(f"Using backbone: {resolved_backbone} ({backbone_cls.__name__})")
+
+    if args.from_scratch:
+        logging.info("--- Training from Scratch ---")
+        base_models = {
+            name: backbone_cls(modality_name=name, **resolved_model_args).to(device)
+            for name in modalities
+        }
+    else:
+        logging.info("--- Loading Pretrained Models for Fine-tuning ---")
+        if resolved_backbone != requested_backbone:
+            logging.warning(
+                "Requested backbone '%s' was overridden to '%s' based on the checkpoint format.",
+                requested_backbone,
+                resolved_backbone,
+            )
+        base_models = load_pretrained_models(
+            ckpt_path,
+            device,
+            resolved_model_args,
+            modalities,
+            backbone=resolved_backbone,
+            checkpoint=preloaded_checkpoint,
+        )
 
     # --- Create Classifier ---
     model = StressClassifier(
@@ -561,7 +763,7 @@ def main():
     parser.add_argument('--head_lr', type=float, default=1e-3, help="Learning rate for the classification head")
     parser.add_argument('--freeze_backbone', action='store_true', help="Freeze the MAE backbones and only train the classifier head")
     parser.add_argument('--from_scratch', action='store_true', help='Train from scratch without loading pretrained weights.')
-    parser.add_argument('--backbone', type=str, default='transformer', choices=sorted(BACKBONE_REGISTRY.keys()),
+    parser.add_argument('--backbone', type=str, default='transformer', choices=FINETUNE_BACKBONE_CHOICES,
                         help='Encoder backbone architecture (must match pretrained checkpoint).')
     parser.add_argument('--lr_restart_epochs', type=int, default=10, help='Number of epochs to restart the learning rate')
     parser.add_argument('--t_mult', type=int, default=2, help='Multiplier for the learning rate scheduler')

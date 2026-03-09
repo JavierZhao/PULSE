@@ -16,8 +16,12 @@ from sklearn.metrics import average_precision_score
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
 from src.data.wesad_dataset import WESADDataset
-from src.model.CheapSensorMAE import CheapSensorMAE
-from src.finetune.finetune import StressClassifier
+from src.finetune.finetune import (
+    StressClassifier,
+    get_finetune_backbone_class,
+    resolve_finetune_backbone_from_checkpoint,
+    resolve_model_args_for_backbone,
+)
 
 
 PREFERRED_MODALITY_ORDER: List[str] = ['ecg', 'bvp', 'acc', 'temp']
@@ -105,6 +109,7 @@ def build_model_from_args(
     fuse_override: Optional[bool] = None,
     linear_override: Optional[bool] = None,
     modalities: Optional[List[str]] = None,
+    checkpoint_state: Optional[Dict[str, Any]] = None,
 ) -> StressClassifier:
     model_args = {
         'sig_len': int(args_dict.get('signal_length', 3840)),
@@ -121,14 +126,22 @@ def build_model_from_args(
     }
     selected_modalities = modalities
     if selected_modalities is None:
-        mod_from_log = str(args_dict.get('modality', 'all'))
+        mod_from_log = str(args_dict.get('modalities', 'all'))
         if mod_from_log == 'all':
             selected_modalities = PREFERRED_MODALITY_ORDER.copy()
         else:
-            selected_modalities = [mod_from_log]
+            selected_modalities = [m.strip() for m in mod_from_log.split(',') if m.strip()]
+
+    backbone_name = str(args_dict.get('backbone', 'transformer'))
+    if checkpoint_state is not None:
+        backbone_name, model_args, resolved_embed_dim, _ = resolve_finetune_backbone_from_checkpoint(
+            checkpoint_state, selected_modalities, backbone_name, model_args
+        )
+    else:
+        model_args, resolved_embed_dim = resolve_model_args_for_backbone(backbone_name, model_args)
 
     base_models = {
-        name: CheapSensorMAE(modality_name=name, **model_args).to(device)
+        name: get_finetune_backbone_class(backbone_name)(modality_name=name, **model_args).to(device)
         for name in selected_modalities
     }
     only_shared = only_shared_override if only_shared_override is not None else _to_bool(args_dict.get('only_shared', False))
@@ -136,7 +149,7 @@ def build_model_from_args(
     linear_classifier = linear_override if linear_override is not None else _to_bool(args_dict.get('linear_classifier', False))
     model = StressClassifier(
         base_models,
-        embed_dim=int(args_dict.get('embed_dim', 1024)),
+        embed_dim=resolved_embed_dim,
         freeze_backbone=False,
         linear_classifier=linear_classifier,
         only_shared=only_shared,
@@ -189,17 +202,32 @@ def evaluate_run_dir_auprc(
     state_keys = list(state.keys())
     is_mlp = any(k.startswith('classifier.3.') for k in state_keys)
     first_w = state.get('classifier.0.weight', None)
-    embed_dim = int(logged_args.get('embed_dim', 1024))
-
     ckpt_modalities = extract_modalities_from_state(state)
     if ckpt_modalities:
         selected_modalities = ckpt_modalities
     else:
-        mod_from_log = str(logged_args.get('modality', 'all'))
-        selected_modalities = PREFERRED_MODALITY_ORDER.copy() if mod_from_log == 'all' else [mod_from_log]
+        mod_from_log = str(logged_args.get('modalities', 'all'))
+        selected_modalities = PREFERRED_MODALITY_ORDER.copy() if mod_from_log == 'all' else [m.strip() for m in mod_from_log.split(',') if m.strip()]
 
     if include_eda and 'eda' not in selected_modalities:
         selected_modalities = selected_modalities + ['eda']
+
+    resolved_model_args = {
+        'sig_len': int(logged_args.get('signal_length', 3840)),
+        'window_len': int(logged_args.get('patch_window_len', 96)),
+        'private_mask_ratio': float(logged_args.get('private_mask_ratio', 0.5)),
+        'embed_dim': int(logged_args.get('embed_dim', 1024)),
+        'depth': int(logged_args.get('depth', 8)),
+        'num_heads': int(logged_args.get('num_heads', 4)),
+        'decoder_embed_dim': int(logged_args.get('decoder_embed_dim', 512)),
+        'decoder_depth': int(logged_args.get('decoder_depth', 4)),
+        'decoder_num_heads': int(logged_args.get('decoder_num_heads', 16)),
+        'mlp_ratio': float(logged_args.get('mlp_ratio', 4.0)),
+        'decoder_mlp_ratio': float(logged_args.get('decoder_mlp_ratio', 4.0)),
+    }
+    _, _, embed_dim, _ = resolve_finetune_backbone_from_checkpoint(
+        state, selected_modalities, str(logged_args.get('backbone', 'transformer')), resolved_model_args
+    )
 
     only_shared_override = None
     fuse_override = None
@@ -229,6 +257,7 @@ def evaluate_run_dir_auprc(
         fuse_override=fuse_override,
         linear_override=linear_override,
         modalities=selected_modalities,
+        checkpoint_state=state,
     )
     try:
         model.load_state_dict(state, strict=True)
@@ -339,5 +368,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
-

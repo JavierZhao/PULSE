@@ -29,8 +29,13 @@ import pandas as pd
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
 from src.data.wesad_dataset import WESADDataset
-from src.model.backbone_registry import BACKBONE_REGISTRY, get_backbone_class
-from src.finetune.finetune import StressClassifier
+from src.finetune.finetune import (
+    FINETUNE_BACKBONE_CHOICES,
+    StressClassifier,
+    get_finetune_backbone_class,
+    resolve_finetune_backbone_from_checkpoint,
+    resolve_model_args_for_backbone,
+)
 from src.finetune.summarize_folds import find_fold_dirs, load_metrics, parse_fold_id, aggregate_metrics
 
 PREFERRED_MODALITY_ORDER: List[str] = ['ecg', 'bvp', 'acc', 'temp']
@@ -148,6 +153,7 @@ def build_model_from_args(
     num_classes: int = 1,
     adaptive_fusion: bool = False,
     backbone: Optional[str] = None,
+    checkpoint_state: Optional[Dict[str, Any]] = None,
 ) -> StressClassifier:
     """Construct StressClassifier with base models using args from log and selected modalities."""
     model_args = {
@@ -165,15 +171,21 @@ def build_model_from_args(
     }
     selected_modalities = modalities
     if selected_modalities is None:
-        mod_from_log = str(args_dict.get('modality', 'all'))
+        mod_from_log = str(args_dict.get('modalities', 'all'))
         if mod_from_log == 'all':
             selected_modalities = PREFERRED_MODALITY_ORDER.copy()
         else:
-            selected_modalities = [mod_from_log]
+            selected_modalities = [m.strip() for m in mod_from_log.split(',') if m.strip()]
 
     # Resolve backbone: CLI override > logged arg > default
     backbone_name = backbone or str(args_dict.get('backbone', 'transformer'))
-    backbone_cls = get_backbone_class(backbone_name)
+    if checkpoint_state is not None:
+        backbone_name, model_args, resolved_embed_dim, _ = resolve_finetune_backbone_from_checkpoint(
+            checkpoint_state, selected_modalities, backbone_name, model_args
+        )
+    else:
+        model_args, resolved_embed_dim = resolve_model_args_for_backbone(backbone_name, model_args)
+    backbone_cls = get_finetune_backbone_class(backbone_name)
 
     base_models = {
         name: backbone_cls(modality_name=name, **model_args).to(device)
@@ -185,7 +197,7 @@ def build_model_from_args(
     linear_classifier = linear_override if linear_override is not None else _to_bool(args_dict.get('linear_classifier', False))
     model = StressClassifier(
         base_models,
-        embed_dim=int(args_dict.get('embed_dim', 1024)),
+        embed_dim=resolved_embed_dim,
         freeze_backbone=False,
         linear_classifier=linear_classifier,
         only_shared=only_shared,
@@ -408,7 +420,6 @@ def evaluate_run_dir(
     is_mlp = any(k.startswith('classifier.3.') for k in state_keys)
     first_w = state.get('classifier.0.weight', None)
     last_w = state.get('classifier.3.weight', None) if is_mlp else state.get('classifier.0.weight', None)
-    embed_dim = int(logged_args.get('embed_dim', 1024))
     num_classes = int(last_w.shape[0]) if last_w is not None and len(last_w.shape) == 2 else 1
     three_class = (num_classes == 3)
     # Detect adaptive fusion params in checkpoint
@@ -423,11 +434,29 @@ def evaluate_run_dir(
         if ckpt_modalities:
             selected_modalities = ckpt_modalities
         else:
-            mod_from_log = str(logged_args.get('modality', 'all'))
-            selected_modalities = PREFERRED_MODALITY_ORDER.copy() if mod_from_log == 'all' else [mod_from_log]
+            mod_from_log = str(logged_args.get('modalities', 'all'))
+            selected_modalities = PREFERRED_MODALITY_ORDER.copy() if mod_from_log == 'all' else [m.strip() for m in mod_from_log.split(',') if m.strip()]
         # Optionally include EDA encoder during evaluation
         if include_eda and 'eda' not in selected_modalities:
             selected_modalities = selected_modalities + ['eda']
+
+    resolved_backbone_name = backbone_override or str(logged_args.get('backbone', 'transformer'))
+    resolved_model_args = {
+        'sig_len': int(logged_args.get('signal_length', 3840)),
+        'window_len': int(logged_args.get('patch_window_len', 96)),
+        'private_mask_ratio': float(logged_args.get('private_mask_ratio', 0.5)),
+        'embed_dim': int(logged_args.get('embed_dim', 1024)),
+        'depth': int(logged_args.get('depth', 8)),
+        'num_heads': int(logged_args.get('num_heads', 4)),
+        'decoder_embed_dim': int(logged_args.get('decoder_embed_dim', 512)),
+        'decoder_depth': int(logged_args.get('decoder_depth', 4)),
+        'decoder_num_heads': int(logged_args.get('decoder_num_heads', 16)),
+        'mlp_ratio': float(logged_args.get('mlp_ratio', 4.0)),
+        'decoder_mlp_ratio': float(logged_args.get('decoder_mlp_ratio', 4.0)),
+    }
+    _, _, embed_dim, _ = resolve_finetune_backbone_from_checkpoint(
+        state, selected_modalities, resolved_backbone_name, resolved_model_args
+    )
 
     only_shared_override = None
     fuse_override = None
@@ -462,6 +491,7 @@ def evaluate_run_dir(
         num_classes=num_classes,
         adaptive_fusion=has_adaptive,
         backbone=backbone_override,
+        checkpoint_state=state,
     )
 
     try:
@@ -568,7 +598,7 @@ def main():
     parser.add_argument('--fold_number', type=int, default=None, help='Optional override of fold_number from log')
     parser.add_argument('--include_eda', action='store_true', help='Include EDA encoder during evaluation if available')
     parser.add_argument('--modalities', type=str, default='all', help='Comma-separated list {ecg,bvp,acc,temp,eda} or "all"; if omitted, infer from checkpoint/log')
-    parser.add_argument('--backbone', type=str, default=None, choices=sorted(BACKBONE_REGISTRY.keys()),
+    parser.add_argument('--backbone', type=str, default=None, choices=FINETUNE_BACKBONE_CHOICES,
                         help='Encoder backbone architecture override. If omitted, infer from finetune log.')
     args = parser.parse_args()
 
