@@ -54,9 +54,6 @@ spec:
               python -m pip install --no-cache-dir numpy pandas tqdm scikit-learn matplotlib scipy timm
 
               cd /j-jepa-vol/PULSE
-              git fetch origin
-              git checkout claude/explore-pretraining-architectures-cXgzI
-              git pull
 
               DATA_PATH="/j-jepa-vol/PULSE/preprocessed_data/60s_0.25s_sid"
               OUT_BASE="/j-jepa-vol/PULSE/results_test/MultiMAE"
