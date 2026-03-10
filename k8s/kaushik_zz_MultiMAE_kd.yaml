@@ -10,6 +10,24 @@ spec:
   template:
     spec:
       restartPolicy: Never
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              git clone --single-branch --branch claude/explore-pretraining-architectures-cXgzI https://github.com/JavierZhao/PULSE.git /opt/repo/PULSE && \
+              chown -R 1000:1000 /opt/repo/PULSE
+          volumeMounts:
+            - name: git-repo
+              mountPath: /opt/repo
+          resources:
+            requests:
+              cpu: "1"
+              memory: 1Gi
+            limits:
+              cpu: "1"
+              memory: 1Gi
       affinity:
         nodeAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
@@ -33,6 +51,8 @@ spec:
                       - NVIDIA-TITAN-RTX
                       - NVIDIA-A10
       volumes:
+        - name: git-repo
+          emptyDir: {}
         - name: work
           persistentVolumeClaim:
             claimName: j-jepa-vol
@@ -53,7 +73,7 @@ spec:
               python -m pip install --no-cache-dir --upgrade typing_extensions
               python -m pip install --no-cache-dir numpy pandas tqdm scikit-learn matplotlib scipy timm
 
-              cd /j-jepa-vol/PULSE
+              cd /opt/repo/PULSE
 
               DATA_PATH="/j-jepa-vol/PULSE/preprocessed_data/60s_0.25s_sid"
               OUT_BASE="/j-jepa-vol/PULSE/results_test/MultiMAE"
@@ -94,6 +114,8 @@ spec:
               echo "${KD_STUDENT_CKPT}" > "${OUT_BASE}/kd_student_ckpt_path.txt"
               echo "Wrote: ${OUT_BASE}/kd_student_ckpt_path.txt"
           volumeMounts:
+            - mountPath: /opt/repo
+              name: git-repo
             - mountPath: /j-jepa-vol
               name: work
             - mountPath: /dev/shm
