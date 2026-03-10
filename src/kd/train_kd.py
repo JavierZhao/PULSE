@@ -4,7 +4,7 @@ import sys
 import math
 from datetime import datetime
 import logging
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -41,7 +41,18 @@ def setup_logging(run_name, output_path):
     logger.addHandler(console_handler)
 
 
-def save_checkpoint(epoch, students, kd_heads, optimizer, scheduler, best_val_loss, losses, path, extra_state=None):
+def save_checkpoint(
+    epoch,
+    students,
+    kd_heads,
+    optimizer,
+    scheduler,
+    best_val_loss,
+    losses,
+    path,
+    extra_state=None,
+    aux_recon_heads=None,
+):
     state = {
         'epoch': epoch,
         'best_val_loss': best_val_loss,
@@ -50,6 +61,8 @@ def save_checkpoint(epoch, students, kd_heads, optimizer, scheduler, best_val_lo
         'optimizer_state_dict': optimizer.state_dict(),
         'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
     }
+    if aux_recon_heads is not None:
+        state['aux_recon_heads_state_dict'] = aux_recon_heads.state_dict()
     for name, model in students.items():
         state[f'{name}_model_state_dict'] = model.state_dict()
     if extra_state is not None:
@@ -263,7 +276,7 @@ def _infer_legacy_multimae_config(student_states: Dict[str, Dict[str, torch.Tens
     return {}
 
 
-def load_checkpoint(path, students, kd_heads, optimizer, scheduler, device):
+def load_checkpoint(path, students, kd_heads, optimizer, scheduler, device, aux_recon_heads=None):
     if not os.path.isfile(path):
         logging.warning(f"Checkpoint file not found at {path}. Starting from scratch.")
         return 0, float('inf'), []
@@ -275,6 +288,10 @@ def load_checkpoint(path, students, kd_heads, optimizer, scheduler, device):
     missing, unexpected = kd_heads.load_state_dict(checkpoint['kd_heads_state_dict'], strict=False)
     if len(missing) > 0 or len(unexpected) > 0:
         logging.warning(f"KDHeads state_dict loaded with missing keys: {missing} and unexpected keys: {unexpected}")
+    if aux_recon_heads is not None and checkpoint.get('aux_recon_heads_state_dict') is not None:
+        missing, unexpected = aux_recon_heads.load_state_dict(checkpoint['aux_recon_heads_state_dict'], strict=False)
+        if len(missing) > 0 or len(unexpected) > 0:
+            logging.warning(f"Aux reconstruction heads loaded with missing keys: {missing} and unexpected keys: {unexpected}")
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     if scheduler is not None and checkpoint.get('scheduler_state_dict') is not None:
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
@@ -428,6 +445,118 @@ class KDHeads(nn.Module):
         return self.fuse_projector(cat)
 
 
+class AuxiliaryReconstructionHeads(nn.Module):
+    def __init__(self, student_dim: int, patch_lens: Dict[str, int], num_patches: Dict[str, int]):
+        super().__init__()
+        self.patch_lens = {m: int(v) for m, v in patch_lens.items()}
+        self.num_patches = {m: int(v) for m, v in num_patches.items()}
+        self.mask_tokens = nn.ParameterDict({
+            m: nn.Parameter(torch.zeros(1, 1, student_dim)) for m in patch_lens.keys()
+        })
+        self.pos_embeds = nn.ParameterDict({
+            m: nn.Parameter(torch.zeros(1, self.num_patches[m], student_dim)) for m in patch_lens.keys()
+        })
+        self.norms = nn.ModuleDict({
+            m: nn.LayerNorm(student_dim) for m in patch_lens.keys()
+        })
+        self.patch_predictors = nn.ModuleDict({
+            m: nn.Sequential(
+                nn.Linear(student_dim, student_dim),
+                nn.GELU(),
+                nn.Linear(student_dim, self.patch_lens[m]),
+            ) for m in patch_lens.keys()
+        })
+
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        for param in self.mask_tokens.values():
+            nn.init.normal_(param, std=0.02)
+        for param in self.pos_embeds.values():
+            nn.init.normal_(param, std=0.02)
+        for predictor in self.patch_predictors.values():
+            for module in predictor:
+                if isinstance(module, nn.Linear):
+                    nn.init.xavier_uniform_(module.weight)
+                    if module.bias is not None:
+                        nn.init.constant_(module.bias, 0)
+
+    def _restore_full_tokens(self, name: str, tokens: torch.Tensor, ids_restore: torch.Tensor) -> torch.Tensor:
+        target_len = int(self.num_patches[name])
+        bsz, keep_len, dim = tokens.shape
+        if keep_len < target_len:
+            mask_tokens = self.mask_tokens[name].expand(bsz, target_len - keep_len, dim)
+            tokens = torch.cat([tokens, mask_tokens], dim=1)
+            tokens = torch.gather(tokens, dim=1, index=ids_restore.unsqueeze(-1).expand(-1, -1, dim))
+        elif keep_len > target_len:
+            tokens = tokens[:, :target_len, :]
+        return tokens
+
+    def forward(self, name: str, private_tokens: torch.Tensor, shared_tokens: torch.Tensor, ids_restore: torch.Tensor) -> torch.Tensor:
+        tokens = private_tokens[:, 1:, :] + shared_tokens[:, 1:, :]
+        tokens = self._restore_full_tokens(name, tokens, ids_restore)
+        tokens = tokens + self.pos_embeds[name][:, :tokens.size(1), :]
+        tokens = self.norms[name](tokens)
+        return self.patch_predictors[name](tokens)
+
+    def patchify(self, sigs: torch.Tensor, name: str) -> torch.Tensor:
+        patch_len = int(self.patch_lens[name])
+        num_patches = int(self.num_patches[name])
+        expected_len = patch_len * num_patches
+        if sigs.shape[-1] != expected_len:
+            sigs = F.interpolate(sigs, size=expected_len, mode='linear', align_corners=False)
+        x = sigs.reshape(sigs.shape[0], sigs.shape[1], num_patches, patch_len)
+        x = torch.einsum("nclp->nlpc", x)
+        return x.reshape(sigs.shape[0], num_patches, patch_len * sigs.shape[1])
+
+    def reconstruction_loss(self, name: str, sigs: torch.Tensor, pred: torch.Tensor, mask: torch.Tensor, normalize_targets: bool = True) -> torch.Tensor:
+        target = self.patchify(sigs, name)
+        if normalize_targets:
+            mean = target.mean(dim=-1, keepdim=True)
+            var = target.var(dim=-1, keepdim=True)
+            target = (target - mean) / (var + 1.e-6) ** 0.5
+        loss = (pred - target) ** 2
+        loss = loss.mean(dim=-1)
+        mask = mask[:, :loss.size(1)]
+        if float(mask.sum().item()) <= 0.0:
+            return loss.mean()
+        return (loss * mask).sum() / mask.sum()
+
+
+def model_supports_native_reconstruction(model: nn.Module) -> bool:
+    if hasattr(model, "supports_reconstruction"):
+        return bool(getattr(model, "supports_reconstruction"))
+    return bool(hasattr(model, "forward_decoder") and hasattr(model, "reconstruction_loss"))
+
+
+def build_reconstruction_mask(ids_restore: torch.Tensor, len_keep: int, num_patches: int, dtype: torch.dtype) -> torch.Tensor:
+    mask = torch.ones(ids_restore.size(0), num_patches, device=ids_restore.device, dtype=dtype)
+    mask[:, :len_keep] = 0
+    return torch.gather(mask, dim=1, index=ids_restore)
+
+
+def compute_student_reconstruction_loss(
+    name: str,
+    x: torch.Tensor,
+    model: nn.Module,
+    mask_ratio: float,
+    aux_recon_heads: Optional[AuxiliaryReconstructionHeads],
+) -> torch.Tensor:
+    ids_shuffle, ids_restore, ids_keep = model.propose_masking(len(x), model.num_patches, mask_ratio, x.device)
+    private, shared, mask = model.forward_encoder(x, mask_ratio, ids_shuffle, ids_restore, ids_keep)
+
+    if model_supports_native_reconstruction(model):
+        rec = model.forward_decoder(private, shared, ids_restore)
+        return model.reconstruction_loss(x, rec, mask)
+
+    if aux_recon_heads is None:
+        raise RuntimeError(f"Reconstruction requested for student '{name}' but no native or auxiliary decoder is available.")
+
+    aux_mask = build_reconstruction_mask(ids_restore, ids_keep.size(1), model.num_patches, private.dtype)
+    rec = aux_recon_heads(name, private, shared, ids_restore)
+    return aux_recon_heads.reconstruction_loss(name, x, rec, aux_mask)
+
+
 def get_hidden_and_final_tokens(model, x, mask_ratio, device):
     # Single pass: returns (hidden tokens per block w/o CLS, final shared tokens w/o CLS, final private tokens w/o CLS)
     ids_shuffle, ids_restore, ids_keep = model.propose_masking(len(x), model.num_patches, mask_ratio, device)
@@ -453,7 +582,7 @@ def map_layers(student_layers, teacher_depth):
 
 
 @torch.no_grad()
-def validate(batch_iter, students, teacher, kd_heads, layers_to_match, layer_map, device, args):
+def validate(batch_iter, students, teacher, kd_heads, layers_to_match, layer_map, device, args, aux_recon_heads=None):
     for model in students.values():
         model.eval()
     teacher.eval()
@@ -547,10 +676,13 @@ def validate(batch_iter, students, teacher, kd_heads, layers_to_match, layer_map
         if args.recon_weight > 0.0:
             recon_loss = 0.0
             for name, x in signals.items():
-                ids_shuffle, ids_restore, ids_keep = students[name].propose_masking(len(x), students[name].num_patches, args.mask_ratio, device)
-                private, shared, mask = students[name].forward_encoder(x, args.mask_ratio, ids_shuffle, ids_restore, ids_keep)
-                rec = students[name].forward_decoder(private, shared, ids_restore)
-                recon_loss = recon_loss + students[name].reconstruction_loss(x, rec, mask)
+                recon_loss = recon_loss + compute_student_reconstruction_loss(
+                    name,
+                    x,
+                    students[name],
+                    args.mask_ratio,
+                    aux_recon_heads,
+                )
         else:
             recon_loss = torch.tensor(0.0, device=device)
 
@@ -791,11 +923,16 @@ def train(args):
     else:
         logging.warning("No valid students_ckpt_path provided. Students start from init.")
 
-    if args.recon_weight > 0.0 and any(not getattr(model, "supports_reconstruction", True) for model in students.values()):
-        raise ValueError(
-            "recon_weight > 0 is not supported with legacy_cmsc student backbone "
-            "(no decoder/reconstruction head). Set --recon_weight 0.0."
-        )
+    patch_lens = {
+        name: max(1, int(round(args.signal_length / max(1, students[name].num_patches))))
+        for name in students.keys()
+    }
+    num_patches_by_mod = {name: int(students[name].num_patches) for name in students.keys()}
+    needs_aux_recon = {
+        name: not model_supports_native_reconstruction(model)
+        for name, model in students.items()
+    }
+    aux_recon_heads = None
 
     with torch.no_grad():
         dummy = torch.zeros(1, 1, args.signal_length, device=device)
@@ -807,6 +944,15 @@ def train(args):
     # Resolve shared_dim to align with teacher when unset/non-positive
     resolved_shared_dim = args.shared_dim if getattr(args, 'shared_dim', -1) and args.shared_dim > 0 else int(teacher_dim)
     logging.info(f"Resolved token dims -> student: {student_dim}, teacher: {teacher_dim}, shared: {resolved_shared_dim}")
+
+    if args.recon_weight > 0.0 and any(needs_aux_recon.values()):
+        aux_recon_heads = AuxiliaryReconstructionHeads(
+            student_dim=student_dim,
+            patch_lens=patch_lens,
+            num_patches=num_patches_by_mod,
+        ).to(device)
+        missing_modalities = [name for name, needed in needs_aux_recon.items() if needed]
+        logging.info(f"Using auxiliary KD reconstruction heads for modalities without native decoders: {missing_modalities}")
 
     # KD heads
     # kd_heads = KDHeads(student_dim=args.embed_dim, teacher_dim=args.embed_dim, shared_dim=args.shared_dim, private_dim=args.private_dim, modalities=list(students.keys())).to(device)
@@ -830,6 +976,8 @@ def train(args):
 
     # Always include KD head parameters in optimizer so they can be unfrozen later
     optim_params = list(kd_heads.parameters())
+    if aux_recon_heads is not None:
+        optim_params += list(aux_recon_heads.parameters())
     for model in students.values():
         optim_params += list(model.parameters())
     optimizer = torch.optim.Adam(optim_params, lr=args.learning_rate)
@@ -866,7 +1014,15 @@ def train(args):
 
     start_epoch, best_val_loss, losses = 0, float('inf'), []
     if args.resume_from:
-        start_epoch, best_val_loss, losses = load_checkpoint(args.resume_from, students, kd_heads, optimizer, scheduler, device)
+        start_epoch, best_val_loss, losses = load_checkpoint(
+            args.resume_from,
+            students,
+            kd_heads,
+            optimizer,
+            scheduler,
+            device,
+            aux_recon_heads=aux_recon_heads,
+        )
 
     for epoch in range(start_epoch, args.num_epochs):
         # Optionally unfreeze fusion projector at the specified epoch (1-based)
@@ -965,10 +1121,13 @@ def train(args):
             if args.recon_weight > 0.0:
                 recon_loss = 0.0
                 for name, x in signals.items():
-                    ids_shuffle, ids_restore, ids_keep = students[name].propose_masking(len(x), students[name].num_patches, args.mask_ratio, device)
-                    private, shared, mask = students[name].forward_encoder(x, args.mask_ratio, ids_shuffle, ids_restore, ids_keep)
-                    rec = students[name].forward_decoder(private, shared, ids_restore)
-                    recon_loss = recon_loss + students[name].reconstruction_loss(x, rec, mask)
+                    recon_loss = recon_loss + compute_student_reconstruction_loss(
+                        name,
+                        x,
+                        students[name],
+                        args.mask_ratio,
+                        aux_recon_heads,
+                    )
             else:
                 recon_loss = torch.tensor(0.0, device=device)
 
@@ -1005,7 +1164,7 @@ def train(args):
             })
 
         # Validation (recompute mapping inside validate per batch as well)
-        val_metrics = validate(val_loader, students, teacher, kd_heads, layers_to_match, None, device, args)
+        val_metrics = validate(val_loader, students, teacher, kd_heads, layers_to_match, None, device, args, aux_recon_heads=aux_recon_heads)
 
         if scheduler is not None:
             scheduler.step()
@@ -1051,7 +1210,8 @@ def train(args):
                 best_val_loss,
                 losses,
                 best_kd_path,
-                extra_state={'teacher_ckpt_used': args.teacher_ckpt_path, 'students_ckpt_used': args.students_ckpt_path}
+                extra_state={'teacher_ckpt_used': args.teacher_ckpt_path, 'students_ckpt_used': args.students_ckpt_path},
+                aux_recon_heads=aux_recon_heads,
             )
             # Save students-only checkpoint for finetuning with the standard name
             students_only_path = os.path.join(models_path, "best_ckpt.pt")
