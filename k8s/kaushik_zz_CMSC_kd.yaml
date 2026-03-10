@@ -63,6 +63,9 @@ spec:
               python -m pip install --no-cache-dir numpy pandas tqdm scikit-learn matplotlib scipy timm
 
               cd /opt/repo/PULSE
+              export PYTHONPATH="/opt/repo/PULSE${PYTHONPATH:+:${PYTHONPATH}}"
+              echo "Working directory: $(pwd)"
+              python -c "import src.kd.train_kd as m; print(f'train_kd module: {m.__file__}')"
 
               DATA_PATH="/j-jepa-vol/PULSE/preprocessed_data/60s_0.25s_sid"
               OUT_BASE="/j-jepa-vol/PULSE/results_test/CMSC"
@@ -81,7 +84,7 @@ spec:
               test -f "${TEACHER_CKPT}" || (echo "ERROR: missing TEACHER_CKPT ${TEACHER_CKPT}" && exit 1)
 
               echo "=== (3) KD: distill teacher -> student (outputs student-only ckpt) ==="
-              python -m src.kd.train_kd \
+              python /opt/repo/PULSE/src/kd/train_kd.py \
                 --data_path "${DATA_PATH}" \
                 --output_path "${KD_OUT}" \
                 --run_name "${KD_RUN}" \
