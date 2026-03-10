@@ -108,15 +108,12 @@ This branch focuses on finetuning. If you want to pretrain CheapSensorMAE backbo
 Example (supervised from-scratch finetune as a warm start):
 
 ```bash
-python -m src.finetune.finetune \
-  --run_name pretrain_like_supervised \
+python -m src.pretrain.train_cheap_mae \
+  --run_name pretrain_job \
   --data_path ./preprocessed_data/60s_0.25s_sid \
   --device cuda:0 \
   --fold_number 17 \
-  --val_subject_id 16 \
-  --modalities all \
-  --from_scratch \
-  --num_epochs 150 \
+  --num_epochs 300 \
   --batch_size 128
 ```
 
