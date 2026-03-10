@@ -340,6 +340,46 @@ def load_pretrained_models(path, device, model_args, modalities=None, backbone='
     logging.info(f"Loaded pretrained models ({backbone}) from {path} for modalities={selected}")
     return models
 
+
+def build_classification_criterion(
+    labels: np.ndarray,
+    device: torch.device,
+    three_class: bool = False,
+    disable_class_balancing: bool = False,
+):
+    labels_np = np.asarray(labels).astype(int)
+    if labels_np.size == 0:
+        logging.warning("Training split is empty. Falling back to unweighted loss.")
+        return nn.CrossEntropyLoss() if three_class else nn.BCEWithLogitsLoss()
+
+    if three_class:
+        counts = np.bincount(labels_np, minlength=3)
+        logging.info(f"Training label distribution (3-class): {dict(enumerate(counts.tolist()))}")
+        if disable_class_balancing or np.any(counts == 0):
+            if np.any(counts == 0):
+                logging.warning("At least one class has zero samples; disabling class-balanced CrossEntropyLoss.")
+            return nn.CrossEntropyLoss()
+
+        weights = labels_np.size / (len(counts) * counts.astype(np.float32))
+        weights = weights / np.mean(weights)
+        weight_tensor = torch.tensor(weights, dtype=torch.float32, device=device)
+        logging.info(f"Using class-balanced CrossEntropyLoss weights: {weights.tolist()}")
+        return nn.CrossEntropyLoss(weight=weight_tensor)
+
+    pos = int(labels_np.sum())
+    neg = int(labels_np.size - pos)
+    logging.info(f"Training label distribution (binary): neg={neg}, pos={pos}, pos_rate={pos / max(1, labels_np.size):.4f}")
+    if disable_class_balancing or pos == 0 or neg == 0:
+        if pos == 0 or neg == 0:
+            logging.warning("Binary training split has a missing class; disabling pos_weight for BCEWithLogitsLoss.")
+        return nn.BCEWithLogitsLoss()
+
+    pos_weight = float(neg / max(1, pos))
+    logging.info(f"Using BCEWithLogitsLoss(pos_weight={pos_weight:.6f})")
+    return nn.BCEWithLogitsLoss(
+        pos_weight=torch.tensor([pos_weight], dtype=torch.float32, device=device)
+    )
+
 def validate(model, dataloader, criterion, device, three_class=False):
     """Runs a validation loop and returns metrics."""
     model.eval()
@@ -617,12 +657,25 @@ def train(args, pretrained_run_name=None):
     logging.info(f"Full training dataset label distribution: {dict(zip(unique_labels, counts))}")
     
     logging.info(f"Training set size: {len(train_dataset)} (subjects other than {args.val_subject_id})")
-    logging.info(f"Validation set size: {len(val_dataset)} (subject {args.val_subject_id})\n")
+    logging.info(f"Validation set size: {len(val_dataset)} (subject {args.val_subject_id})")
+    if len(train_indices) > 0:
+        train_labels = np.asarray(full_train_dataset.labels)[train_indices]
+        train_label_vals, train_label_counts = np.unique(train_labels, return_counts=True)
+        logging.info(f"Train split label distribution: {dict(zip(train_label_vals.tolist(), train_label_counts.tolist()))}")
+    if len(val_indices) > 0:
+        val_labels = np.asarray(full_train_dataset.labels)[val_indices]
+        val_label_vals, val_label_counts = np.unique(val_labels, return_counts=True)
+        logging.info(f"Val split label distribution: {dict(zip(val_label_vals.tolist(), val_label_counts.tolist()))}\n")
 
     train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
     val_dataloader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
-    
-    criterion = nn.CrossEntropyLoss() if getattr(args, 'three_class', False) else nn.BCEWithLogitsLoss()
+
+    criterion = build_classification_criterion(
+        np.asarray(train_dataset.dataset.labels)[train_indices] if len(train_indices) > 0 else np.array([], dtype=int),
+        device,
+        three_class=getattr(args, 'three_class', False),
+        disable_class_balancing=getattr(args, 'disable_class_balancing', False),
+    )
     
     best_val_ap = float('-inf')
     best_val_acc = float('-inf')
@@ -787,6 +840,7 @@ def main():
     parser.add_argument('--val_selection_metric', type=str, default='auprc', choices=['accuracy', 'auprc'], help='Metric to select best model on validation set')
     parser.add_argument('--three_class', action='store_true', help='Use three-class classification (baseline, stress, amusement)')
     parser.add_argument('--adaptive_fusion', action='store_true', help='Use learnable per-modality fusion weights when fusing embeddings')
+    parser.add_argument('--disable_class_balancing', action='store_true', help='Disable automatic class-balanced loss weighting during finetuning')
 
     args = parser.parse_args()
     
