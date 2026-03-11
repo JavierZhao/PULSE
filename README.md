@@ -9,7 +9,7 @@ This branch documents the time-series pipeline (no MFCC). It covers environment 
 Conda (recommended):
 
 ```bash
-conda env create -f dl.yml
+conda env create -f env/dl.yml
 conda activate dl
 ```
 
