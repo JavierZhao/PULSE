@@ -1,3 +1,6 @@
+# Copyright (c) 2026 PULSE contributors
+# SPDX-License-Identifier: MIT
+
 import importlib
 import inspect
 import os
