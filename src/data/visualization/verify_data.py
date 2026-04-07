@@ -11,7 +11,8 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '.
 from src.secure_io import load_npz_archive
 
 # ── 1.  Path to the .npz fold you want to inspect ─────────────────────────
-fold_path = "/fd24T/zzhao3/EDA/preprocessed_data/60s_0.25s/fold_2.npz"        # adapt as needed
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
+fold_path = os.path.join(REPO_ROOT, "preprocessed_data", "60s_0.25s_sid", "fold_2.npz")  # adapt as needed
 
 # ── 2.  Load the archive ──────────────────────────────────────────────────
 with load_npz_archive(fold_path) as data:

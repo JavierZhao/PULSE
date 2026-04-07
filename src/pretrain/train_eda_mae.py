@@ -322,8 +322,8 @@ def train(args):
 def main():
     parser = argparse.ArgumentParser(description='Train an EDA teacher with masked reconstruction pretraining for KD.')
     parser.add_argument('--run_name', type=str, default=datetime.now().strftime("%Y%m%d_%H%M%S"))
-    parser.add_argument('--data_path', type=str, default="/j-jepa-vol/PULSE/preprocessed_data/60s_0.25s_sid", help='Path to the WESAD preprocessed data directory')
-    parser.add_argument('--output_path', type=str, default="/j-jepa-vol/PULSE/results/eda_mae", help='Directory to save logs and models')
+    parser.add_argument('--data_path', type=str, default="./preprocessed_data/60s_0.25s_sid", help='Path to the WESAD preprocessed data directory')
+    parser.add_argument('--output_path', type=str, default="./results/eda_mae", help='Directory to save logs and models')
     parser.add_argument('--fold_number', type=int, default=17, help='The fold number to use for training/validation')
     parser.add_argument('--resume_from', type=str, default=None, help='Path to a checkpoint file to resume training from.')
     parser.add_argument('--teacher_for', type=str, default='mae',

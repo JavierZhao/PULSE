@@ -248,9 +248,9 @@ def main():
     parser.add_argument('--run_name', type=str,
                         default=datetime.now().strftime("%Y%m%d_%H%M%S_autoregressive"))
     parser.add_argument('--data_path', type=str,
-                        default="/j-jepa-vol/PULSE/preprocessed_data/60s_0.25s_sid")
+                        default="./preprocessed_data/60s_0.25s_sid")
     parser.add_argument('--output_path', type=str,
-                        default="/j-jepa-vol/PULSE/results/autoregressive")
+                        default="./results/autoregressive")
     parser.add_argument('--fold_number', type=int, default=17)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--device', type=str,

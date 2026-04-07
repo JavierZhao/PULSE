@@ -12,7 +12,8 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '.
 from src.secure_io import load_npz_archive
 
 # --- Configuration ---
-PREPROCESSED_DIR = '/fd24T/zzhao3/EDA/preprocessed_data'
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
+PREPROCESSED_DIR = os.path.join(REPO_ROOT, 'preprocessed_data')
 NUM_SAMPLES_TO_PLOT = 4
 FS = 64 # The target sample rate from the preprocessing script
 OUTPUT_DIR = 'figures/temp_only_plots'

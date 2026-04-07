@@ -16,13 +16,15 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '.
 from src.secure_io import load_wesad_pickle
 
 # Optional cvxEDA import (only needed for feature extraction, not raw data export)
+CVXEDA_SRC = os.environ.get('CVXEDA_SRC')
 try:
-    sys.path.append('/fd24T/zzhao3/EDA/cvxEDA/src')  # Adjust path as needed
+    if CVXEDA_SRC:
+        sys.path.append(CVXEDA_SRC)
     from cvxEDA import cvxEDA
     CVXEDA_AVAILABLE = True
 except ImportError:
     CVXEDA_AVAILABLE = False
-    print("Warning: cvxEDA not available. Feature extraction will not work.")
+    print("Warning: cvxEDA not available. Set CVXEDA_SRC if feature extraction is needed.")
 
 # E4 (wrist) Sampling Frequencies
 fs_dict = {'ACC': 32, 'BVP': 64, 'EDA': 4, 'TEMP': 4, 'label': 700, 'Resp': 700}

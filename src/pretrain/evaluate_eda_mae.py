@@ -69,7 +69,7 @@ def build_eda_teacher_model(args, device):
 def main():
     parser = argparse.ArgumentParser(description='Evaluate a trained EDA MAE model and plot reconstruction.')
     parser.add_argument('--checkpoint_path', type=str, required=True, help='Path to the trained model checkpoint (.pt file).')
-    parser.add_argument('--data_path', type=str, default="/j-jepa-vol/PULSE/preprocessed_data/60s_0.25s_sid", help='Path to the WESAD preprocessed data directory.')
+    parser.add_argument('--data_path', type=str, default="./preprocessed_data/60s_0.25s_sid", help='Path to the WESAD preprocessed data directory.')
     parser.add_argument('--output_path', type=str, default=".", help='Directory to save the reconstruction plot and log file.')
     parser.add_argument('--fold_number', type=int, default=17, help='The fold number to use for the test set.')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu', help="Specify the device for evaluation.")

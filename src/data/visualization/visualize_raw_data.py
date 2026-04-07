@@ -14,7 +14,8 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '.
 from src.secure_io import load_wesad_pickle
 
 # --- Configuration ---
-DATA_DIR = '/fd24T/zzhao3/EDA/data'
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
+DATA_DIR = os.path.join(REPO_ROOT, 'data')
 WESAD_PKL_DIR = os.path.join(DATA_DIR, 'WESAD')
 RAW_CSV_DIR = DATA_DIR 
 OUTPUT_DIR = 'figures/raw_plots'

@@ -268,7 +268,7 @@ def run_checks(args: argparse.Namespace) -> Dict:
 def main():
     parser = argparse.ArgumentParser(description='Check if KD student models have collapsed.')
     parser.add_argument('--students_ckpt_path', type=str, required=True, help='Path to students-only checkpoint (best_ckpt.pt)')
-    parser.add_argument('--data_path', type=str, default='/fd24T/zzhao3/EDA/preprocessed_data/60s_0.25s')
+    parser.add_argument('--data_path', type=str, default='./preprocessed_data/60s_0.25s_sid')
     parser.add_argument('--fold_number', type=int, default=17)
     parser.add_argument('--split', type=str, default='train', choices=['train', 'test'])
     parser.add_argument('--batch_size', type=int, default=64)
@@ -283,4 +283,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

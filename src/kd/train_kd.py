@@ -1241,8 +1241,8 @@ def parse_layers(s):
 def main():
     parser = argparse.ArgumentParser(description='Knowledge Distillation: EDA teacher -> student models')
     parser.add_argument('--run_name', type=str, default=datetime.now().strftime("%Y%m%d_%H%M%S"))
-    parser.add_argument('--data_path', type=str, default="/j-jepa-vol/PULSE/preprocessed_data/60s_0.25s_sid")
-    parser.add_argument('--output_path', type=str, default="/j-jepa-vol/PULSE/results/kd")
+    parser.add_argument('--data_path', type=str, default="./preprocessed_data/60s_0.25s_sid")
+    parser.add_argument('--output_path', type=str, default="./results/kd")
     parser.add_argument('--fold_number', type=int, default=17)
     parser.add_argument('--resume_from', type=str, default=None)
     parser.add_argument('--seed', type=int, default=42)
@@ -1298,8 +1298,8 @@ def main():
     parser.add_argument('--unfreeze_fuse_projector_epoch', type=int, default=-1, help='Epoch at which to unfreeze the fusion projector (1-based). -1 means never unfreeze; 0 means start unfrozen.')
 
     # Checkpoints
-    parser.add_argument('--teacher_ckpt_path', type=str, default="/j-jepa-vol/PULSE/results/eda_mae/300p/models/best_ckpt.pt", help='Path to teacher best_ckpt.pt from EDA MAE training')
-    parser.add_argument('--students_ckpt_path', type=str, default="/j-jepa-vol/PULSE/results/cheap_maes/hinge_loss/default/models/best_ckpt.pt", help='Path to students best_ckpt.pt from multi-modal MAE pretraining')
+    parser.add_argument('--teacher_ckpt_path', type=str, default="./results/eda_mae/300p/models/best_ckpt.pt", help='Path to teacher best_ckpt.pt from EDA MAE training')
+    parser.add_argument('--students_ckpt_path', type=str, default="./results/cheap_maes/hinge_loss/default/models/best_ckpt.pt", help='Path to students best_ckpt.pt from multi-modal MAE pretraining')
 
     args = parser.parse_args()
 
