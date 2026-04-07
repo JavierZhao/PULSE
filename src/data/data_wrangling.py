@@ -32,6 +32,7 @@ int_to_label = {1: 'baseline', 2: 'stress', 0: 'amusement'}
 feat_names = None
 savePath = 'data'
 subject_feature_path = '/subject_feats'
+wesad_root = os.path.join(savePath, 'WESAD')
 
 if not os.path.exists(savePath):
     os.makedirs(savePath)
@@ -240,7 +241,7 @@ def get_samples(data, n_windows, label):
 
 def get_raw_data(subject_id):
     # Make subject data object for Sx
-    subject = SubjectData(main_path='/j-jepa-vol/PULSE/data/WESAD', subject_number=subject_id)
+    subject = SubjectData(main_path=wesad_root, subject_number=subject_id)
     
     # Get wrist and chest data
     wrist_data = subject.get_wrist_data()
@@ -278,7 +279,7 @@ def make_patient_data(subject_id):
     global WINDOW_IN_SECONDS
 
     # Make subject data object for Sx
-    subject = SubjectData(main_path='/j-jepa-vol/PULSE/data/WESAD', subject_number=subject_id)
+    subject = SubjectData(main_path=wesad_root, subject_number=subject_id)
 
     # Empatica E4 data - now with resp
     e4_data_dict = subject.get_wrist_data()

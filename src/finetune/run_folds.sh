@@ -4,10 +4,13 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+
 # --- config you might tweak ---
-WORKDIR="~/EDA/EDA_Gen/src/finetune"
+WORKDIR="${SCRIPT_DIR}"
 ENV_ACTIVATE="$HOME/envs/dl/bin/activate"
-RUN_NAME="~/EDA/results/eda_mae/300p/models/best_ckpt.pt"
+RUN_NAME="${REPO_ROOT}/results/eda_mae/eda_teacher/models/best_ckpt.pt"
 BATCH_SIZE=128
 EPOCHS=300
 RESTART_EPOCHS=300
@@ -78,7 +81,7 @@ python finetune.py \
   --fold_number __FOLD__ \
   --save_name __SAVE_NAME__ \
   --three_class \
-  --adaptive
+  --adaptive_fusion
 EOF
 
   sed -i \

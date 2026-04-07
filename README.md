@@ -95,6 +95,8 @@ unzip WESAD.zip
 cd ..
 ```
 
+Official dataset download and documentation are available from the [WESAD download page](https://uni-siegen.sciebo.de/s/HGdUkoNlW1Ub0Gx/download); this repository does not bundle the original WESAD documentation PDF.
+
 The expected raw layout is:
 
 ```text

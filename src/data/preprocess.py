@@ -28,9 +28,10 @@ NATIVE_FS = {
 }
 
 # Paths
-DATA_DIR = '/j-jepa-vol/PULSE/data'
-WESAD_PKL_DIR = '/j-jepa-vol/PULSE/data/WESAD'
-OUTPUT_DIR = '/j-jepa-vol/PULSE/preprocessed_data/60s_0.25s_sid'
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+DATA_DIR = os.path.join(REPO_ROOT, 'data')
+WESAD_PKL_DIR = os.path.join(DATA_DIR, 'WESAD')
+OUTPUT_DIR = os.path.join(REPO_ROOT, 'preprocessed_data', '60s_0.25s_sid')
 SUBJECT_IDS = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17]
 
 
