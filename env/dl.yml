@@ -21,4 +21,3 @@ dependencies:
   - tmux
   - tqdm
   - pytorch-cuda=11.8
-prefix: /fd24T/zzhao3/miniconda3/envs/dl
