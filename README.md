@@ -2,6 +2,10 @@
 
 This branch documents the time-series pipeline (no MFCC). It covers environment setup, data preprocessing to LOSO folds, finetuning, and multi-fold launches.
 
+## License
+
+This repository is released under the MIT License. See [LICENSE](LICENSE) for details.
+
 ---
 
 ## 1) Environment
@@ -248,5 +252,3 @@ python -m src.kd.train_kd \
 Outputs:
 - Full KD checkpoint: `./results/kd/<run_name>/models/best_ckpt_full_kd.pt`
 - Students-only checkpoint (for finetune): `./results/kd/<run_name>/models/best_ckpt.pt`
-
-

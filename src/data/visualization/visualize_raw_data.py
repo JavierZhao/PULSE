@@ -1,10 +1,17 @@
+# Copyright (c) 2026 PULSE contributors
+# SPDX-License-Identifier: MIT
+
 import os
-import pickle
+import sys
 import argparse
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..')))
+
+from src.secure_io import load_wesad_pickle
 
 # --- Configuration ---
 DATA_DIR = '/fd24T/zzhao3/EDA/data'
@@ -79,8 +86,7 @@ def plot_raw_subject_data(subject_id):
         return
         
     print(f"  - Loading labels from {pkl_path}")
-    with open(pkl_path, 'rb') as file:
-        pkl_data = pickle.load(file, encoding='latin1')
+    pkl_data = load_wesad_pickle(pkl_path)
     labels = pkl_data['label'].ravel()
 
     # print the label distribution

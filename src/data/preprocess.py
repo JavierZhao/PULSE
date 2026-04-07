@@ -1,10 +1,17 @@
+# Copyright (c) 2026 PULSE contributors
+# SPDX-License-Identifier: MIT
+
 import os
-import pickle
+import sys
 import numpy as np
 import pandas as pd
 from scipy import stats
 from scipy.signal import butter, filtfilt, resample_poly
 import argparse
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+
+from src.secure_io import load_wesad_pickle
 
 
 # --- Configuration ---
@@ -58,8 +65,7 @@ class SubjectData:
                 print(f"    - Warning: {fname} not found for subject {self.name}.")
         
         # Load the ground-truth labels from the original pkl file.
-        with open(self.subject_pkl_path, 'rb') as file:
-            original_data = pickle.load(file, encoding='latin1')
+        original_data = load_wesad_pickle(self.subject_pkl_path)
         signals['label'] = original_data['label']
 
         return signals
@@ -369,8 +375,9 @@ def main():
             fold_path,
             X_train=X_train, Y_train=Y_train, L_train=L_train, S_train=S_train,
             X_test=X_test, Y_test=Y_test, L_test=L_test, S_test=S_test,
-            test_subject_stats=test_stats,
-            feature_names=feature_names
+            test_subject_mean=test_stats['mean'],
+            test_subject_std=test_stats['std'],
+            feature_names=np.asarray(feature_names, dtype=np.str_)
         )
         print(f"  · Saved {fold_path} "
               f"({X_train.shape[0]} train, {X_test.shape[0]} test windows)")

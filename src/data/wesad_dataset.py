@@ -1,9 +1,13 @@
+# Copyright (c) 2026 PULSE contributors
+# SPDX-License-Identifier: MIT
+
 import os
-import pickle
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 import logging
+
+from src.secure_io import load_npz_archive
 
 class WESADDataset(Dataset):
     """Loads all required modalities, labels, and subject IDs from a preprocessed WESAD .npz fold."""
@@ -14,7 +18,7 @@ class WESADDataset(Dataset):
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"Data file not found: {file_path}")
         
-        with np.load(file_path, allow_pickle=True) as data:
+        with load_npz_archive(file_path) as data:
             if split == 'train':
                 self.X = data['X_train']
                 self.Y = data['Y_train']
@@ -27,8 +31,7 @@ class WESADDataset(Dataset):
                 self.S = data.get('S_test', np.array([-1] * len(self.X))) # Use get for backward compatibility
             else:
                 raise ValueError("split must be 'train' or 'test'")
-
-            self.feature_names = data['feature_names']
+            self.feature_names = np.asarray(data['feature_names']).astype(str, copy=False)
             
         # Get the indices for each required modality
         self.ecg_idx = np.where(self.feature_names == 'ecg')[0][0]

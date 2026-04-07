@@ -1,3 +1,6 @@
+# Copyright (c) 2026 PULSE contributors
+# SPDX-License-Identifier: MIT
+
 """
 Multi-modal autoregressive (GPT-style next-patch prediction) pretraining for
 physiological signals.

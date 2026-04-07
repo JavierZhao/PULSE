@@ -1,7 +1,15 @@
+# Copyright (c) 2026 PULSE contributors
+# SPDX-License-Identifier: MIT
+
 import os
+import sys
 import numpy as np
 import matplotlib.pyplot as plt
 import argparse
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..')))
+
+from src.secure_io import load_npz_archive
 
 # --- Configuration ---
 PREPROCESSED_DIR = '/fd24T/zzhao3/EDA/preprocessed_data'
@@ -29,15 +37,13 @@ def plot_temp_for_fold(fold_number):
 
     print(f"Loading data from {file_path}...")
     try:
-        data = np.load(file_path, allow_pickle=True)
+        with load_npz_archive(file_path) as data:
+            X_test = data['X_test']
+            L_test = data['L_test']
+            feature_names = np.asarray(data['feature_names']).astype(str, copy=False)
     except Exception as e:
         print(f"Error loading .npz file: {e}")
         return
-
-    # 2. Extract the necessary arrays
-    X_test = data['X_test']
-    L_test = data['L_test']
-    feature_names = data['feature_names']
 
     # Find the index for the 'temp' signal
     try:

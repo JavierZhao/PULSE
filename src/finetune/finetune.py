@@ -1,3 +1,6 @@
+# Copyright (c) 2026 PULSE contributors
+# SPDX-License-Identifier: MIT
+
 import argparse
 import os
 import sys
@@ -17,6 +20,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '.
 
 from src.model.backbone_registry import BACKBONE_REGISTRY, get_backbone_class
 from src.data.wesad_dataset import WESADDataset
+from src.secure_io import load_torch_checkpoint
 
 
 FINETUNE_BACKBONE_CHOICES = sorted(BACKBONE_REGISTRY.keys()) + ['legacy_cmsc', 'legacy_multimae']
@@ -327,7 +331,7 @@ def setup_logging(run_name, output_path):
 def load_pretrained_models(path, device, model_args, modalities=None, backbone='transformer', checkpoint=None):
     """Loads the pretrained models from a checkpoint file."""
     backbone_cls = get_finetune_backbone_class(backbone)
-    checkpoint = checkpoint if checkpoint is not None else torch.load(path, map_location=device)
+    checkpoint = checkpoint if checkpoint is not None else load_torch_checkpoint(path, map_location=device)
 
     selected = modalities if modalities is not None else ['ecg', 'bvp', 'acc', 'temp']
     models = {}
@@ -563,7 +567,7 @@ def train(args, pretrained_run_name=None):
                 "Provide a full path to a file or models dir, or ensure legacy path exists."
             )
 
-        preloaded_checkpoint = torch.load(ckpt_path, map_location=device)
+        preloaded_checkpoint = load_torch_checkpoint(ckpt_path, map_location=device)
         resolved_backbone, resolved_model_args, resolved_embed_dim, backbone_source = resolve_finetune_backbone_from_checkpoint(
             preloaded_checkpoint, modalities, requested_backbone, base_model_args
         )

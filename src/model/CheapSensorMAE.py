@@ -1,3 +1,6 @@
+# Copyright (c) 2026 PULSE contributors
+# SPDX-License-Identifier: MIT
+
 # Author: Nabil Ibtehaz (https://github.com/nibtehaz)
 # Insprired from https://github.com/facebookresearch/MAE
 

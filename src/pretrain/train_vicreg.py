@@ -1,3 +1,6 @@
+# Copyright (c) 2026 PULSE contributors
+# SPDX-License-Identifier: MIT
+
 """
 Multi-modal VICReg pretraining for physiological signals.
 
@@ -35,6 +38,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '.
 
 from src.model.VICRegEncoder import VICRegModel
 from src.data.wesad_dataset import WESADDataset
+from src.secure_io import load_torch_checkpoint
 from src.modules.hinge_loss import AllPairsHingeLoss
 
 
@@ -72,7 +76,7 @@ def load_checkpoint(path, models, optimizers, schedulers, device):
     if not os.path.isfile(path):
         logging.warning(f"Checkpoint not found at {path}. Starting from scratch.")
         return 0, float('inf'), []
-    checkpoint = torch.load(path, map_location=device)
+    checkpoint = load_torch_checkpoint(path, map_location=device)
     for name, model in models.items():
         model.load_state_dict(checkpoint[f'{name}_model_state_dict'])
     for name, opt in optimizers.items():

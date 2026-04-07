@@ -1,3 +1,6 @@
+# Copyright (c) 2026 PULSE contributors
+# SPDX-License-Identifier: MIT
+
 import argparse
 import os
 import sys
@@ -13,6 +16,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '.
 
 from src.model.CheapSensorMAE import CheapSensorMAE
 from src.data.wesad_dataset import WESADDataset
+from src.secure_io import load_torch_checkpoint
 
 
 def infer_student_config(state_dict: Dict[str, torch.Tensor]) -> Dict[str, int]:
@@ -222,7 +226,7 @@ def run_checks(args: argparse.Namespace) -> Dict:
     device = torch.device(args.device)
 
     # Load students-only checkpoint
-    ckpt = torch.load(args.students_ckpt_path, map_location=device)
+    ckpt = load_torch_checkpoint(args.students_ckpt_path, map_location=device)
 
     # Data
     ds = WESADDataset(data_path=args.data_path, fold_number=args.fold_number, split=args.split)
@@ -279,5 +283,4 @@ def main():
 
 if __name__ == '__main__':
     main()
-
 

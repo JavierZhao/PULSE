@@ -1,3 +1,6 @@
+# Copyright (c) 2026 PULSE contributors
+# SPDX-License-Identifier: MIT
+
 # AutoregressiveTransformer: Causal (GPT-style) next-patch prediction for
 # physiological time-series self-supervised pretraining.
 #

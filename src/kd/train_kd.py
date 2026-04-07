@@ -1,3 +1,6 @@
+# Copyright (c) 2026 PULSE contributors
+# SPDX-License-Identifier: MIT
+
 import argparse
 import os
 import sys
@@ -19,6 +22,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '.
 
 from src.model.backbone_registry import BACKBONE_REGISTRY, get_backbone_class
 from src.data.wesad_dataset import WESADDataset
+from src.secure_io import load_torch_checkpoint
 from src.utils import plot_kd_losses
 
 
@@ -281,7 +285,7 @@ def load_checkpoint(path, students, kd_heads, optimizer, scheduler, device, aux_
         logging.warning(f"Checkpoint file not found at {path}. Starting from scratch.")
         return 0, float('inf'), []
 
-    checkpoint = torch.load(path, map_location=device)
+    checkpoint = load_torch_checkpoint(path, map_location=device)
     for name, model in students.items():
         model.load_state_dict(checkpoint[f'{name}_model_state_dict'])
     # Allow for backward-compatibility if KDHeads structure changed (e.g., removed teacher projector)
@@ -728,7 +732,7 @@ def train(args):
     legacy_cmsc_cfg: Dict[str, int] = {}
     legacy_multimae_cfg: Dict[str, int] = {}
     if args.students_ckpt_path is not None and os.path.isfile(args.students_ckpt_path):
-        preloaded_student_ckpt = torch.load(args.students_ckpt_path, map_location=device)
+        preloaded_student_ckpt = load_torch_checkpoint(args.students_ckpt_path, map_location=device)
         preloaded_student_states, preloaded_student_source = _extract_student_state_dicts(
             preloaded_student_ckpt, student_modalities
         )
@@ -851,7 +855,7 @@ def train(args):
 
     # Load checkpoints
     if args.teacher_ckpt_path is not None and os.path.isfile(args.teacher_ckpt_path):
-        ckpt = torch.load(args.teacher_ckpt_path, map_location=device)
+        ckpt = load_torch_checkpoint(args.teacher_ckpt_path, map_location=device)
         key = 'model_state_dict' if 'model_state_dict' in ckpt else next((k for k in ckpt.keys() if k.endswith('model_state_dict')), None)
         if key is None:
             logging.warning("Could not find teacher model_state_dict in checkpoint. Skipping load.")
@@ -862,7 +866,7 @@ def train(args):
         logging.warning("No valid teacher_ckpt_path provided. Using randomly initialized teacher (frozen).")
 
     if args.students_ckpt_path is not None and os.path.isfile(args.students_ckpt_path):
-        ckpt = preloaded_student_ckpt if preloaded_student_ckpt is not None else torch.load(args.students_ckpt_path, map_location=device)
+        ckpt = preloaded_student_ckpt if preloaded_student_ckpt is not None else load_torch_checkpoint(args.students_ckpt_path, map_location=device)
         modalities = list(students.keys())
         if preloaded_student_ckpt is not None:
             student_states, source = preloaded_student_states, preloaded_student_source

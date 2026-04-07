@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright (c) 2026 PULSE contributors
+# SPDX-License-Identifier: MIT
+
 set -euo pipefail
 
 # --- config you might tweak ---

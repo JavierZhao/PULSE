@@ -1,3 +1,6 @@
+# Copyright (c) 2026 PULSE contributors
+# SPDX-License-Identifier: MIT
+
 # VICRegEncoder: Variance-Invariance-Covariance Regularization for
 # physiological time-series self-supervised pretraining.
 #

@@ -1,3 +1,6 @@
+# Copyright (c) 2026 PULSE contributors
+# SPDX-License-Identifier: MIT
+
 import argparse
 import os
 import sys
@@ -10,6 +13,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '.
 
 from src.model.backbone_registry import MAE_BACKBONE_REGISTRY
 from src.data.wesad_dataset import WESADDataset
+from src.secure_io import load_torch_checkpoint
 from src.utils import plot_single_reconstruction
 
 def setup_logging(output_path):
@@ -109,7 +113,7 @@ def main():
     model = build_eda_teacher_model(args, device)
     
     # Load the state dict
-    checkpoint = torch.load(args.checkpoint_path, map_location=device)
+    checkpoint = load_torch_checkpoint(args.checkpoint_path, map_location=device)
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
     

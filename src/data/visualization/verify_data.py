@@ -1,10 +1,20 @@
+# Copyright (c) 2026 PULSE contributors
+# SPDX-License-Identifier: MIT
+
+import os
+import sys
+
 import numpy as np
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..')))
+
+from src.secure_io import load_npz_archive
 
 # ── 1.  Path to the .npz fold you want to inspect ─────────────────────────
 fold_path = "/fd24T/zzhao3/EDA/preprocessed_data/60s_0.25s/fold_2.npz"        # adapt as needed
 
 # ── 2.  Load the archive ──────────────────────────────────────────────────
-with np.load(fold_path, allow_pickle=True) as data:
+with load_npz_archive(fold_path) as data:
     # list all arrays stored in the file
     print("Arrays in archive:", list(data.keys()))
     
@@ -19,8 +29,13 @@ with np.load(fold_path, allow_pickle=True) as data:
     L_test  = data["L_test"]
     
     # optional: per-subject baseline stats and feature names
-    stats   = data["test_subject_stats"].item()   # dict with 'mean' and 'std'
-    feat    = data["feature_names"]
+    stats = None
+    if "test_subject_mean" in data and "test_subject_std" in data:
+        stats = {
+            "mean": data["test_subject_mean"],
+            "std": data["test_subject_std"],
+        }
+    feat = np.asarray(data["feature_names"]).astype(str, copy=False)
 
 # ── 3.  Report counts ─────────────────────────────────────────────────────
 print(f"\nTRAIN windows  : {X_train.shape[0]:,}")

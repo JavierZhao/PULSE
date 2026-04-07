@@ -1,3 +1,6 @@
+# Copyright (c) 2026 PULSE contributors
+# SPDX-License-Identifier: MIT
+
 # TCN: Temporal Convolutional Network backbone for physiological time-series
 #
 # An alternative to both Transformers and plain ResNets.  Uses stacked dilated

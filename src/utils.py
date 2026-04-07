@@ -1,3 +1,6 @@
+# Copyright (c) 2026 PULSE contributors
+# SPDX-License-Identifier: MIT
+
 import matplotlib.pyplot as plt
 import torch
 import numpy as np

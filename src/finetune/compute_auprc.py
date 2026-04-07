@@ -1,3 +1,6 @@
+# Copyright (c) 2026 PULSE contributors
+# SPDX-License-Identifier: MIT
+
 import argparse
 import json
 import os
@@ -22,6 +25,7 @@ from src.finetune.finetune import (
     resolve_finetune_backbone_from_checkpoint,
     resolve_model_args_for_backbone,
 )
+from src.secure_io import load_torch_checkpoint
 
 
 PREFERRED_MODALITY_ORDER: List[str] = ['ecg', 'bvp', 'acc', 'temp']
@@ -198,7 +202,7 @@ def evaluate_run_dir_auprc(
     if dp is None:
         return None
 
-    state = torch.load(ckpt_path, map_location=device)
+    state = load_torch_checkpoint(ckpt_path, map_location=device)
     state_keys = list(state.keys())
     is_mlp = any(k.startswith('classifier.3.') for k in state_keys)
     first_w = state.get('classifier.0.weight', None)

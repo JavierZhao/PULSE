@@ -1,5 +1,7 @@
+# Copyright (c) 2026 PULSE contributors
+# SPDX-License-Identifier: MIT
+
 import os
-import pickle
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -8,6 +10,10 @@ import scipy.signal as scisig
 import scipy.stats
 import sys
 import argparse
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+
+from src.secure_io import load_wesad_pickle
 
 # Optional cvxEDA import (only needed for feature extraction, not raw data export)
 try:
@@ -50,8 +56,7 @@ class SubjectData:
         self.signal_keys = ['chest', 'wrist']
         self.chest_keys = ['ACC', 'ECG', 'EMG', 'EDA', 'Temp', 'Resp']
         self.wrist_keys = ['ACC', 'BVP', 'EDA', 'TEMP']
-        with open(os.path.join(main_path, self.name) + '/' + self.name + '.pkl', 'rb') as file:
-            self.data = pickle.load(file, encoding='latin1')
+        self.data = load_wesad_pickle(os.path.join(main_path, self.name, f'{self.name}.pkl'))
         self.labels = self.data['label']
 
     def get_wrist_data(self):
@@ -168,10 +173,10 @@ def compute_features(e4_data_dict, labels, norm_type=None):
     df['label'] = df['label'].fillna(method='bfill')
     df.reset_index(drop=True, inplace=True)
 
-    if norm_type is 'std':
+    if norm_type == 'std':
         # std norm
         df = (df - df.mean()) / df.std()
-    elif norm_type is 'minmax':
+    elif norm_type == 'minmax':
         # minmax norm
         df = (df - df.min()) / (df.max() - df.min())
 

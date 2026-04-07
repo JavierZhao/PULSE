@@ -1,3 +1,6 @@
+# Copyright (c) 2026 PULSE contributors
+# SPDX-License-Identifier: MIT
+
 # ContrastiveEncoder: SimCLR-style contrastive learning for physiological signals
 #
 # Instead of reconstructing masked patches (MAE), this approach learns

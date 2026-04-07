@@ -1,3 +1,6 @@
+# Copyright (c) 2026 PULSE contributors
+# SPDX-License-Identifier: MIT
+
 """
 Shared backbone registry for all training, finetuning, and evaluation scripts.
 

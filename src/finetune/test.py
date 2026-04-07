@@ -1,3 +1,6 @@
+# Copyright (c) 2026 PULSE contributors
+# SPDX-License-Identifier: MIT
+
 import argparse
 import os
 import sys
@@ -37,6 +40,7 @@ from src.finetune.finetune import (
     resolve_model_args_for_backbone,
 )
 from src.finetune.summarize_folds import find_fold_dirs, load_metrics, parse_fold_id, aggregate_metrics
+from src.secure_io import load_torch_checkpoint
 
 PREFERRED_MODALITY_ORDER: List[str] = ['ecg', 'bvp', 'acc', 'temp']
 
@@ -415,7 +419,7 @@ def evaluate_run_dir(
         return
 
     # Inspect checkpoint to infer classifier architecture and modalities
-    state = torch.load(ckpt_path, map_location=device)
+    state = load_torch_checkpoint(ckpt_path, map_location=device)
     state_keys = list(state.keys())
     is_mlp = any(k.startswith('classifier.3.') for k in state_keys)
     first_w = state.get('classifier.0.weight', None)
