@@ -1,19 +1,75 @@
-# EDA_Gen (Time-Series): Finetuning MAE Backbones for Stress Prediction
+# PULSE
 
-This branch documents the time-series pipeline (no MFCC). It covers environment setup, data preprocessing to LOSO folds, finetuning, and multi-fold launches.
+**PULSE: Privileged Knowledge Transfer from Rich to Deployable Sensors for Embodied Multi-Sensory Learning**
 
-## License
+This repository contains the research code for **PULSE**, a framework for learning from a rich sensor during training while deploying on cheaper sensors at inference time. In the wearable stress-monitoring setting studied in the paper, **electrodermal activity (EDA)** acts as a privileged teacher modality, while **ECG, BVP, accelerometry, and temperature** are the deployable student modalities.
 
-This repository is released under the MIT License. See [LICENSE](LICENSE) for details.
+PULSE is motivated by a common embodied-sensing problem: the most informative modality in the lab is often too fragile, expensive, or inconvenient to rely on after deployment. The code in this repository implements the training pipeline used to transfer that privileged information into representations learned by lower-cost sensors.
 
----
+The accompanying paper reports that, on **WESAD leave-one-subject-out evaluation**, PULSE reaches **0.994 AUROC** and **0.988 AUPRC** for binary stress detection **without EDA at inference time**. The paper also reports cross-dataset results on PhysioNet STRESS; the public preprocessing utilities in this repository are currently centered on **WESAD**.
 
-## 1) Environment
+## Paper
 
-Conda (recommended):
+**Zihan Zhao, Kaushik Pendiyala, Masood Mortazavi, Ning Yan**  
+*PULSE: Privileged Knowledge Transfer from Rich to Deployable Sensors for Embodied Multi-Sensory Learning*  
+Accepted at the **CVPR 2026 Workshop on Sense of Space**
+
+## What This Repository Includes
+
+- WESAD preprocessing into leave-one-subject-out fold archives
+- Self-supervised pretraining for:
+  - privileged EDA teacher models
+  - cheap-sensor student encoders
+  - multiple backbone families, including transformer, ResNet1D, and TCN
+- Knowledge distillation from a frozen privileged teacher to deployable students
+- Supervised finetuning for binary or three-class stress prediction
+- Evaluation, fold summarization, and plotting utilities
+
+## Method Overview
+
+PULSE is organized as a three-stage pipeline:
+
+1. **Privileged teacher pretraining**
+   - Train an EDA-only encoder with masked reconstruction.
+2. **Student pretraining**
+   - Pretrain the deployable sensor encoders with shared/private embeddings and cross-modal alignment.
+3. **Privileged knowledge transfer + finetuning**
+   - Distill the frozen teacher into the student encoders, then finetune a classifier that runs without the privileged sensor.
+
+The core design idea is to split each student representation into:
+
+- **shared embeddings**, which capture modality-invariant information aligned across sensors and matched to the teacher
+- **private embeddings**, which preserve modality-specific structure needed for reconstruction and collapse prevention
+
+## Repository Layout
+
+- `src/data/preprocess.py`
+  - Builds leave-one-subject-out WESAD folds from raw CSV plus original WESAD labels
+- `src/data/wesad_dataset.py`
+  - Dataset loader for preprocessed fold files
+- `src/pretrain/train_eda_mae.py`
+  - Trains the privileged EDA teacher
+- `src/pretrain/train_cheap_mae.py`
+  - Pretrains student encoders on deployable sensors
+- `src/kd/train_kd.py`
+  - Distills the frozen teacher into student encoders
+- `src/finetune/finetune.py`
+  - Trains the downstream stress classifier
+- `src/finetune/test.py`
+  - Evaluates saved finetuning runs and writes metrics/plots
+- `src/finetune/summarize_folds.py`
+  - Aggregates metrics across folds
+- `src/model/`
+  - Backbone implementations and registry
+- `env/dl.yml`, `env/requirements.txt`
+  - Environment definitions
+
+## Setup
+
+Conda:
 
 ```bash
-conda env create -f dl.yml
+conda env create -f env/dl.yml
 conda activate dl
 ```
 
@@ -22,75 +78,54 @@ Pip:
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r env/requirements.txt
 ```
 
----
+## Data
 
-## 2) Repository Structure (time-series)
+### WESAD
 
-- `src/data/preprocess.py`: Build LOSO folds from raw CSV + WESAD pickle
-- `src/data/wesad_dataset.py`: Dataset for time-series folds
-- `src/model/CheapSensorMAE.py`: Time-series MAE backbone
-
-- **Pretraining:**
-  - `src/pretrain/pretrain.py`: Self-supervised pretraining for CheapSensorMAE backbones
-
-- **Finetuning:**
-  - `src/finetune/finetune.py`: Finetuning script for stress classification
-  - `src/finetune/run_folds.sh`: tmux launcher for multi-fold runs
-
-- **Knowledge Transfer (Distillation):**
-  - `src/kd/train_kd.py`: Knowledge distillation (teacher-student) training script
-
-- **Testing & Evaluation:**
-  - `src/finetune/test.py`: Evaluate trained models and output metrics
-  - `src/finetune/summarize_folds.py`: Aggregate and summarize results across folds
-
-- `results/`: Outputs (models, logs) created at runtime
-
----
-
-## 3) Data Preparation (LOSO time-series)
-
-### Step 1: Download WESAD Dataset
-
-Download the WESAD dataset:
+Download and extract the WESAD dataset from the official source:
 
 ```bash
-mkdir data
+mkdir -p data
 cd data
 wget --content-disposition "https://uni-siegen.sciebo.de/s/HGdUkoNlW1Ub0Gx/download"
+unzip WESAD.zip
 cd ..
 ```
 
-This will download `WESAD.zip` to the `data/` directory.
+The expected raw layout is:
 
-### Step 2: Extract WESAD Dataset
-
-Extract the WESAD dataset to `data/WESAD/`:
-
-```bash
-unzip data/WESAD.zip -d data/
+```text
+data/WESAD/S2/S2.pkl
+data/WESAD/S3/S3.pkl
+...
 ```
 
-This will create the directory structure: `data/WESAD/SXX/SXX.pkl` for all subjects.
+### Convert raw WESAD files to CSV
 
-### Step 3: Generate Raw CSV Files
-
-Convert the pickle files to raw CSVs using the data wrangling script:
+The preprocessing pipeline expects per-subject raw CSV exports. Generate them with:
 
 ```bash
 python src/data/data_wrangling.py --mode raw
 ```
 
-This creates `data/SXX_raw_data/*.csv` directories with sensor data for each subject (ECG, BVP, EDA, temperature, accelerometer).
+This creates directories such as:
 
-### Step 4: Preprocess Data into LOSO Folds
+```text
+data/S2_raw_data/
+data/S3_raw_data/
+...
+```
 
-Edit `src/data/preprocess.py` to set:
-- `DATA_DIR`, `WESAD_PKL_DIR`, `OUTPUT_DIR`
-- `TARGET_FS`, `WINDOW_SECONDS`, `STRIDE_SECONDS`
+### Build leave-one-subject-out folds
+
+Before running the fold builder, update the path constants near the top of `src/data/preprocess.py`:
+
+- `DATA_DIR`
+- `WESAD_PKL_DIR`
+- `OUTPUT_DIR`
 
 Then run:
 
@@ -98,157 +133,146 @@ Then run:
 python -m src.data.preprocess
 ```
 
-This creates `fold_*.npz` under `OUTPUT_DIR` containing train/test windows, labels and subject IDs.
+This produces `fold_<subject>.npz` archives containing train/test windows, labels, subject IDs, and normalization statistics.
 
----
+## Reproducing the Main Pipeline
 
-## 4) Pretraining Backbones (Time-Series)
+The examples below use explicit paths rather than relying on the repository's built-in default paths, which currently reflect the authors' research environment.
 
-This branch focuses on finetuning. If you want to pretrain CheapSensorMAE backbones from scratch (self-supervised), you can:
-
-- Train with the finetune script using `--from_scratch` and a smaller model (acts as supervised pretraining on the target task), or
-- Use your own pretraining pipeline to produce a checkpoint with keys `<modality>_model_state_dict` and place it under `./results/cheap_maes/<run_name>/models/best_ckpt.pt` so finetune can load it automatically.
-
-Example (supervised from-scratch finetune as a warm start):
+### 1. Train the privileged EDA teacher
 
 ```bash
-python -m src.finetune.finetune \
-  --run_name pretrain_like_supervised \
-  --data_path ./preprocessed_data/60s_0.25s_sid \
-  --device cuda:0 \
+python -m src.pretrain.train_eda_mae \
+  --run_name eda_teacher \
+  --data_path /path/to/preprocessed_wesad \
+  --output_path ./results/eda_mae \
   --fold_number 17 \
-  --val_subject_id 16 \
-  --modalities all \
-  --from_scratch \
-  --num_epochs 150 \
-  --batch_size 128
+  --device cuda:0 \
+  --backbone transformer
 ```
 
----
+Output checkpoint:
 
-## 5) Finetuning (single fold)
+```text
+./results/eda_mae/eda_teacher/models/best_ckpt.pt
+```
 
-Minimal example (from scratch):
+### 2. Pretrain deployable student encoders
 
 ```bash
-python -m src.finetune.finetune \
-  --run_name finetune_example \
-  --data_path ./preprocessed_data/60s_0.25s_sid \
-  --device cuda:0 \
+python -m src.pretrain.train_cheap_mae \
+  --run_name cheap_pretrain \
+  --data_path /path/to/preprocessed_wesad \
+  --output_path ./results/cheap_maes \
   --fold_number 17 \
-  --val_subject_id 16 \
-  --modalities all \
-  --from_scratch \
-  --num_epochs 150 \
-  --batch_size 128
-```
-
-Using pretrained backbones (if you have `results/cheap_maes/<run>/models/best_ckpt.pt`):
-
-```bash
-python -m src.finetune.finetune \
-  --run_name finetune_pretrained \
-  --data_path ./preprocessed_data/60s_0.25s_sid \
   --device cuda:0 \
-  --fold_number 17 \
-  --val_subject_id 16 \
-  --modalities all \
-  --num_epochs 150 \
-  --batch_size 128
+  --modalities ecg,bvp,acc,temp \
+  --backbone transformer
 ```
 
-Notes:
-- `--modalities` accepts a comma list from `{ecg,bvp,acc,temp,eda}` or `all`.
-- Use `--freeze_backbone` to train only the classifier.
-- `--fuse_embeddings` and `--only_shared` control feature fusion strategy.
+Output checkpoint:
 
----
-
-## 6) Multi-Fold Finetuning (tmux)
-
-Edit `src/finetune/run_folds.sh`:
-- `WORKDIR`, `ENV_ACTIVATE`, `RUN_NAME`, `SESSION_PREFIX`
-- `FOLDS=(...)` subject IDs
-
-Launch:
-
-```bash
-bash src/finetune/run_folds.sh
+```text
+./results/cheap_maes/cheap_pretrain/models/best_ckpt.pt
 ```
 
-The script detects GPUs and assigns one per session in round-robin order. Logs go to `logs/` under `WORKDIR`.
-
----
-
-## 7) Testing (evaluate runs)
-
-Use `src/finetune/test.py` to evaluate a single run directory (containing `finetune.log` and `best_model.pt`) or a parent directory with multiple fold subdirectories. It reconstructs the model from the logged training args and checkpoint, evaluates on the test split, and writes metrics/plots.
-
-Single run dir:
-
-```bash
-python -m src.finetune.test \
-  --run_dir ./results/finetuned_models/your_run_dir \
-  --device cuda:0 \
-  --batch_size 256 \
-  --data_path ./preprocessed_data/60s_0.25s_sid \
-  --fold_number 17 \
-  --modalities all
-```
-
-Parent dir (iterates over subfolders and aggregates per-fold):
-
-```bash
-python -m src.finetune.test \
-  --run_dir ./results/finetuned_models/your_parent_dir \
-  --device cuda:0 \
-  --batch_size 256 \
-  --data_path ./preprocessed_data/60s_0.25s_sid \
-  --modalities all
-```
-
-Outputs per run:
-- `test_metrics.json`, `test_classification_report*.txt`
-- `test_confusion_matrix*.png`, `test_roc_curve.png`, `test_pr_curve.png`
-
-Aggregates in parent dir:
-- `fold_test_per_fold.csv`, `fold_test_summary.json`, `fold_test_summary.csv`
-
----
-
-## 8) Tips
-
-- Check `finetune.py --help` for all options (learning rates, scheduler restarts, embedding fusion, etc.).
-- Ensure validation subject differs from the fold’s held-out test subject.
-- For reproducibility, set `--seed` and keep window/stride consistent with preprocessing.
-
----
-
-## 9) Knowledge Distillation (EDA teacher → CheapSensor students)
-
-Distill an EDA MAE teacher into CheapSensorMAE students across other modalities.
+### 3. Distill from the privileged teacher
 
 ```bash
 python -m src.kd.train_kd \
-  --run_name kd_example \
-  --data_path ./preprocessed_data/60s_0.25s_sid \
-  --device cuda:0 \
+  --run_name pulse_kd \
+  --data_path /path/to/preprocessed_wesad \
+  --output_path ./results/kd \
   --fold_number 17 \
+  --device cuda:0 \
   --modalities ecg,bvp,acc,temp \
-  --batch_size 128 \
-  --num_epochs 300 \
-  --learning_rate 1e-4 \
-  --mask_ratio 0.75 \
-  --layers_to_match 3,5,7 \
-  --kd_loss cosine \
-  --lambda_hid 1.0 \
-  --lambda_emb 1.0 \
-  --perp_weight 0.0 \
-  --recon_weight 0.0 \
-  --teacher_ckpt_path ./results/eda_mae/teacher_run/models/best_ckpt.pt \
-  --students_ckpt_path ./results/cheap_maes/base_run/models/best_ckpt.pt
+  --teacher_ckpt_path ./results/eda_mae/eda_teacher/models/best_ckpt.pt \
+  --students_ckpt_path ./results/cheap_maes/cheap_pretrain/models/best_ckpt.pt
 ```
 
 Outputs:
-- Full KD checkpoint: `./results/kd/<run_name>/models/best_ckpt_full_kd.pt`
-- Students-only checkpoint (for finetune): `./results/kd/<run_name>/models/best_ckpt.pt`
+
+```text
+./results/kd/pulse_kd/models/best_ckpt_full_kd.pt
+./results/kd/pulse_kd/models/best_ckpt.pt
+```
+
+The `best_ckpt.pt` file is the student-only checkpoint intended for finetuning.
+
+### 4. Finetune the downstream classifier
+
+```bash
+python -m src.finetune.finetune \
+  --run_name ./results/kd/pulse_kd/models/best_ckpt.pt \
+  --save_name pulse_finetune \
+  --data_path /path/to/preprocessed_wesad \
+  --output_path ./results/finetuned_models \
+  --fold_number 17 \
+  --val_subject_id 16 \
+  --device cuda:0 \
+  --modalities ecg,bvp,acc,temp \
+  --num_epochs 150 \
+  --batch_size 128 \
+  --fuse_embeddings
+```
+
+Notes:
+
+- `--run_name` is also used to resolve the pretrained checkpoint path unless `--from_scratch` is set.
+- `--save_name` controls the finetuning output directory.
+- `--modalities` accepts a comma-separated subset of `{ecg,bvp,acc,temp,eda}` or `all`.
+- Use `--three_class` for baseline/stress/amusement classification.
+
+### 5. Evaluate a run or a parent directory of folds
+
+```bash
+python -m src.finetune.test \
+  --run_dir ./results/finetuned_models/pulse_finetune \
+  --data_path /path/to/preprocessed_wesad \
+  --device cuda:0 \
+  --batch_size 256 \
+  --modalities ecg,bvp,acc,temp
+```
+
+Typical outputs include:
+
+- `test_metrics.json`
+- `test_classification_report*.txt`
+- `test_confusion_matrix*.png`
+- `test_roc_curve.png`
+- `test_pr_curve.png`
+- fold summary CSV/JSON files when evaluating a parent directory
+
+## Other Training Utilities
+
+The repository also includes alternative pretraining scripts:
+
+- `src/pretrain/train_contrastive.py`
+- `src/pretrain/train_vicreg.py`
+- `src/pretrain/train_autoregressive.py`
+
+These are useful for baseline comparisons or ablations against the main masked-reconstruction pipeline used in the paper.
+
+## Practical Notes
+
+- The public release is currently **WESAD-first**. Some paper results use additional datasets that are not yet exposed through a matching public preprocessing script here.
+- Several preprocessing and visualization scripts still contain editable path constants from the original research workflow. Public users should override CLI paths where available and update those constants where necessary.
+- `src/finetune/run_folds.sh` is a convenience launcher for multi-fold experiments in a `tmux` plus multi-GPU environment. It is optional and assumes some shell-level setup.
+- Check `--help` on the main scripts for the full list of architecture and optimization options.
+
+## Citation
+
+If you use this repository, please cite:
+
+```bibtex
+@inproceedings{zhao2026pulse,
+  title={PULSE: Privileged Knowledge Transfer from Rich to Deployable Sensors for Embodied Multi-Sensory Learning},
+  author={Zhao, Zihan and Pendiyala, Kaushik and Mortazavi, Masood and Yan, Ning},
+  booktitle={Proceedings of the CVPR 2026 Workshop on Sense of Space},
+  year={2026}
+}
+```
+
+## License
+
+This repository is released under the MIT License. See [LICENSE](LICENSE) for details.
