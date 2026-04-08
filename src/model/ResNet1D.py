@@ -1,4 +1,4 @@
-# Copyright (c) 2026 PULSE contributors
+# Copyright (c) 2026 Futurewei Technologies, Inc.
 # SPDX-License-Identifier: MIT
 
 # ResNet1D: 1D Residual Network backbone for physiological time-series

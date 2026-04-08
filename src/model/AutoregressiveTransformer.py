@@ -1,4 +1,4 @@
-# Copyright (c) 2026 PULSE contributors
+# Copyright (c) 2026 Futurewei Technologies, Inc.
 # SPDX-License-Identifier: MIT
 
 # AutoregressiveTransformer: Causal (GPT-style) next-patch prediction for

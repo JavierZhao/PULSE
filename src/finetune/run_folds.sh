@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Copyright (c) 2026 PULSE contributors
+# Copyright (c) 2026 Futurewei Technologies, Inc.
 # SPDX-License-Identifier: MIT
 
 set -euo pipefail
